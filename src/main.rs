@@ -1,4 +1,4 @@
-use std::{net::SocketAddr};
+use std::net::SocketAddr;
 
 use crate::{
     inbound::inbound_tcp,
@@ -7,6 +7,8 @@ use crate::{
 
 mod inbound;
 mod outbound;
+mod pipe;
+mod rev_tcp;
 
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
