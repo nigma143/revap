@@ -13,7 +13,6 @@ use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{
         mpsc::{self, error::TryRecvError, Receiver, Sender},
-        watch::channel,
     },
 };
 
@@ -22,7 +21,7 @@ use crate::pipe::{self, PipeReader, PipeWriter};
 enum Frame {
     New { id: u32, rem_w_size: u32 },
     Content { id: u32, payload: Vec<u8> },
-    ContentProcessed { id: u32, processed: u32 },
+    ContentProcessed { id: u32, remaining: u32 },
     Terminated { id: u32 },
 }
 
@@ -49,9 +48,9 @@ async fn read_frame<R: AsyncRead + Unpin>(mut read: R) -> io::Result<Frame> {
         }
         0x02 => {
             let id = read.read_u32().await?;
-            let processed = read.read_u32().await?;
+            let remaining = read.read_u32().await?;
 
-            Frame::ContentProcessed { id, processed }
+            Frame::ContentProcessed { id, remaining }
         }
         0x03 => {
             let id = read.read_u32().await?;
@@ -80,10 +79,10 @@ async fn write_frame<W: AsyncWrite + Unpin>(mut write: W, value: Frame) -> io::R
             write.write_u32(payload.len() as u32).await?;
             write.write_all(&payload).await?;
         }
-        Frame::ContentProcessed { id, processed } => {
+        Frame::ContentProcessed { id, remaining } => {
             write.write_u8(0x03).await?;
             write.write_u32(id).await?;
-            write.write_u32(processed).await?;
+            write.write_u32(remaining).await?;
         }
         Frame::Terminated { id } => {
             write.write_u8(0x04).await?;
@@ -96,14 +95,14 @@ async fn write_frame<W: AsyncWrite + Unpin>(mut write: W, value: Frame) -> io::R
 
 const DEFAULT_REM_WIN_SIZE: u32 = 5 * 20 * 1024;
 
-pub struct MuxConnector {
+pub struct Multiplexor {
     message_tx: Sender<Frame>,
     connect_tx: Sender<Incoming>,
     listen_rx: Receiver<Outcoming>,
     last_id: Arc<AtomicU32>,
 }
 
-impl MuxConnector {
+impl Multiplexor {
     pub fn new<S>(stream: S) -> Self
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
@@ -112,7 +111,7 @@ impl MuxConnector {
 
         let (message_tx, message_rx) = mpsc::channel(1024);
         let message_tx_ref = message_tx.clone();
-
+        
         let (connect_tx, connect_rx) = mpsc::channel(1024);
         let (listen_tx, listen_rx) = mpsc::channel(1024);
 
@@ -129,19 +128,54 @@ impl MuxConnector {
         }
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.message_tx.is_closed() || self.connect_tx.is_closed()
+    }
+
+    pub async fn listen(&mut self) -> io::Result<(PipeWriter, PipeReader)> {
+        let outcoming = self
+            .listen_rx
+            .recv()
+            .await
+            .ok_or(io::Error::new(io::ErrorKind::Other, "listen channel is die"))?;
+
+        let w_size = outcoming.rem_w_size.load(std::sync::atomic::Ordering::Relaxed);
+        let (write_out, read_out) = pipe::new_pipe(w_size);
+
+        let message_tx = self.message_tx.clone();
+
+        tokio::spawn(async move {
+            output_conn_loop(message_tx, outcoming.id, read_out, outcoming.rem_w_size)
+                .await
+                .unwrap();
+        });
+
+        Ok((write_out, outcoming.rx))
+    }
+
     pub async fn connect(&mut self) -> io::Result<(PipeWriter, PipeReader)> {
         let id = self
             .last_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rem_w_size = Arc::new(AtomicU32::new(DEFAULT_REM_WIN_SIZE));
+        let w_size = DEFAULT_REM_WIN_SIZE;
 
-        let (write_in, read_in) = pipe::new_pipe(DEFAULT_REM_WIN_SIZE as usize);
-        let (write_out, read_out) = pipe::new_pipe(DEFAULT_REM_WIN_SIZE as usize);
+        let (write_in, read_in) = pipe::new_pipe(w_size as usize);
+        let (write_out, read_out) = pipe::new_pipe(w_size as usize);
+
+        self.message_tx
+            .send(Frame::New {
+                id,
+                rem_w_size: w_size.clone(),
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "message channel is die"))?;
+
+        let w_size = Arc::new(AtomicUsize::new(w_size as usize));
 
         let incoming = Incoming {
             id,
             tx: write_in,
-            rem_w_size: rem_w_size.clone(),
+            rem_w_size: w_size.clone(),
         };
 
         self.connect_tx
@@ -152,7 +186,7 @@ impl MuxConnector {
         let message_tx = self.message_tx.clone();
 
         tokio::spawn(async move {
-            output_conn_loop(message_tx, id, read_out, rem_w_size)
+            output_conn_loop(message_tx, id, read_out, w_size)
                 .await
                 .unwrap();
         });
@@ -165,7 +199,7 @@ async fn output_conn_loop(
     message_tx: Sender<Frame>,
     id: u32,
     mut reader: PipeReader,
-    rem_w_size: Arc<AtomicU32>,
+    rem_w_size: Arc<AtomicUsize>,
 ) -> io::Result<()> {
     let mut buf = [0_u8; 2 * 1024];
     loop {
@@ -186,7 +220,7 @@ async fn output_conn_loop(
                         })?;
                     return Ok(());
                 } else {
-                    rem_w_size.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+                    rem_w_size.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
                     message_tx
                         .send(Frame::Content {
                             id,
@@ -214,13 +248,13 @@ async fn output_conn_loop(
 struct Incoming {
     id: u32,
     tx: PipeWriter,
-    rem_w_size: Arc<AtomicU32>,
+    rem_w_size: Arc<AtomicUsize>,
 }
 
 struct Outcoming {
     id: u32,
     rx: PipeReader,
-    rem_w_size: Arc<AtomicU32>,
+    rem_w_size: Arc<AtomicUsize>,
 }
 
 async fn write_loop<W>(mut write: W, mut message_rx: Receiver<Frame>) -> io::Result<()>
@@ -257,8 +291,8 @@ where
     loop {
         match read_frame(&mut read).await? {
             Frame::New { id, rem_w_size } => {
-                let (mut tx, rx) = pipe::new_pipe(DEFAULT_REM_WIN_SIZE as usize);
-                let rem_w_size = Arc::new(AtomicU32::new(rem_w_size));
+                let (tx, rx) = pipe::new_pipe(rem_w_size as usize);
+                let rem_w_size = Arc::new(AtomicUsize::new(rem_w_size as usize));
 
                 listen_tx
                     .send(Outcoming {
@@ -295,7 +329,7 @@ where
                             message_tx
                                 .send(Frame::ContentProcessed {
                                     id,
-                                    processed: payload.len() as u32,
+                                    remaining: c.tx.remaining() as u32,
                                 })
                                 .await
                                 .map_err(|_| {
@@ -315,10 +349,10 @@ where
                     None => error!("unknown connect `{}`", id),
                 }
             },
-            Frame::ContentProcessed { id, processed } => match map.get_mut(&id) {
+            Frame::ContentProcessed { id, remaining } => match map.get_mut(&id) {
                 Some(c) => {
                     c.rem_w_size
-                        .fetch_add(processed, std::sync::atomic::Ordering::Relaxed);
+                        .store(remaining as usize, std::sync::atomic::Ordering::Relaxed);
                 }
                 None => error!("unknown connect `{}`", id),
             },
