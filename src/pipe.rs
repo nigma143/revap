@@ -22,6 +22,12 @@ pub struct PipeReader {
     read: Arc<Mutex<Pipe>>,
 }
 
+impl PipeReader {
+    pub fn remaining(&self) -> usize {
+        self.read.lock().unwrap().remaining()
+    }
+}
+
 impl AsyncRead for PipeReader {
     // Previous rustc required this `self` to be `mut`, even though newer
     // versions recognize it isn't needed to call `lock()`. So for
@@ -47,6 +53,12 @@ impl Drop for PipeReader {
 #[derive(Debug)]
 pub struct PipeWriter {
     write: Arc<Mutex<Pipe>>,
+}
+
+impl PipeWriter {
+    pub fn remaining(&self) -> usize {
+        self.write.lock().unwrap().remaining()
+    }
 }
 
 impl AsyncWrite for PipeWriter {
@@ -115,6 +127,10 @@ impl Pipe {
             read_waker: None,
             write_waker: None,
         }
+    }
+
+    fn remaining(&self) -> usize {
+        self.max_buf_size - self.buffer.len()
     }
 
     fn close_write(&mut self) {
