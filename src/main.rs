@@ -1,9 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::{
-    inbound::inbound_tcp,
-    outbound::{Outbound, TcpOutbound, TlsOutbound},
-};
+use crate::{inbound::{inbound_revtcp, inbound_tcp}, outbound::{Outbound, TcpOutbound, TlsOutbound}};
 
 mod inbound;
 mod outbound;
@@ -14,7 +11,7 @@ mod rev_tcp;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
 
-    let addr1 = SocketAddr::from(([0, 0, 0, 0], 5001));
+    let addr1 = SocketAddr::from(([127, 0, 0, 1], 5001));
 
     let outbounds = vec![
         Outbound::Tcp(TcpOutbound::new(
@@ -25,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
     ];
 
-    inbound_tcp(addr1, outbounds).await?;
+    inbound_revtcp(addr1, outbounds).await?;
 
     Ok(())
 }

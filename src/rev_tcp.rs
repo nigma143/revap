@@ -1,19 +1,13 @@
-use std::{
-    cmp,
-    collections::HashMap,
-    io,
-    sync::{
+use std::{borrow::Borrow, cmp, collections::HashMap, io, net::SocketAddr, sync::{
         atomic::{AtomicU32, AtomicUsize},
         Arc,
-    },
-};
+    }, time::Duration};
 
-use log::error;
+use log::{debug, error, info};
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{
-        mpsc::{self, error::TryRecvError, Receiver, Sender},
-    },
+    net::TcpStream,
+    sync::mpsc::{self, error::TryRecvError, Receiver, Sender},
 };
 
 use crate::pipe::{self, PipeReader, PipeWriter};
@@ -111,7 +105,7 @@ impl Multiplexor {
 
         let (message_tx, message_rx) = mpsc::channel(1024);
         let message_tx_ref = message_tx.clone();
-        
+
         let (connect_tx, connect_rx) = mpsc::channel(1024);
         let (listen_tx, listen_rx) = mpsc::channel(1024);
 
@@ -132,14 +126,15 @@ impl Multiplexor {
         self.message_tx.is_closed() || self.connect_tx.is_closed()
     }
 
-    pub async fn listen(&mut self) -> io::Result<(PipeWriter, PipeReader)> {
-        let outcoming = self
-            .listen_rx
-            .recv()
-            .await
-            .ok_or(io::Error::new(io::ErrorKind::Other, "listen channel is die"))?;
+    pub async fn listen(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
+        let outcoming = self.listen_rx.recv().await.ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "listen channel is die",
+        ))?;
 
-        let w_size = outcoming.rem_w_size.load(std::sync::atomic::Ordering::Relaxed);
+        let w_size = outcoming
+            .rem_w_size
+            .load(std::sync::atomic::Ordering::Relaxed);
         let (write_out, read_out) = pipe::new_pipe(w_size);
 
         let message_tx = self.message_tx.clone();
@@ -150,10 +145,10 @@ impl Multiplexor {
                 .unwrap();
         });
 
-        Ok((write_out, outcoming.rx))
+        Ok((outcoming.rx, write_out))
     }
 
-    pub async fn connect(&mut self) -> io::Result<(PipeWriter, PipeReader)> {
+    pub async fn connect(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
         let id = self
             .last_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -191,7 +186,7 @@ impl Multiplexor {
                 .unwrap();
         });
 
-        Ok((write_out, read_in))
+        Ok((read_in, write_out))
     }
 }
 
@@ -364,4 +359,59 @@ where
     }
 
     unreachable!();
+}
+
+pub struct RevTcpConnector {
+
+}
+
+impl RevTcpConnector {
+    pub fn bind(addr: SocketAddr) -> Self {
+        
+    }
+}
+
+pub struct RevTcpListener {
+    addr: SocketAddr,
+    mux: Option<Multiplexor>,
+}
+
+impl RevTcpListener {
+    pub fn bind(addr: SocketAddr) -> Self {
+        Self { addr, mux: None }
+    }
+
+    pub async fn accept(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
+        loop {
+            if self.mux.is_none() {
+                let stream = match TcpStream::connect(self.addr).await {
+                    Ok(o) => {
+                        info!("connected to `{}`", self.addr);
+                        o
+                    },
+                    Err(e) => {
+                        error!("error on connect to `{}`. detail: {}", self.addr, e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                self.mux = Some(Multiplexor::new(stream));
+            }
+
+            let mux = self.mux.as_mut().unwrap();
+
+            let res = match mux.listen().await {
+                Ok(o) => {
+                    debug!("incoming mux channel from `{}`", self.addr);
+                    o
+                },
+                Err(e) => {
+                    error!("error on listen mux channel from `{}`. detail: {}", self.addr, e);
+                    continue;
+                },
+            };
+
+            return Ok(res);
+        }
+    }
 }
