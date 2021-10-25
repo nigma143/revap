@@ -1,11 +1,14 @@
 use std::{fmt, io, net::SocketAddr, sync::Arc};
 
+use log::info;
 use rustls::ClientConfig;
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
 };
 use tokio_rustls::client::TlsStream;
+
+use crate::rev_tcp::RevTcpConnector;
 
 pub enum Incoming<R, W> {
     Tcp {
@@ -19,6 +22,7 @@ pub enum Incoming<R, W> {
 pub enum Outbound {
     Tcp(TcpOutbound),
     Tls(TlsOutbound),
+    RevTcp(RevTcpConnector),
 }
 
 impl fmt::Display for Outbound {
@@ -26,6 +30,7 @@ impl fmt::Display for Outbound {
         match self {
             Outbound::Tcp(t) => write!(f, "tcp({})", t.addr),
             Outbound::Tls(t) => write!(f, "tls({})", t.addr),
+            Outbound::RevTcp(t) => write!(f, "rev-tcp({})", "Asdsad"),
         }
     }
 }
@@ -52,6 +57,11 @@ impl Outbound {
             }
             Outbound::Tls(tls) => {
                 let (out_reader, out_writer) = tls.connect().await?;
+                self.process(in_reader, in_writer, out_reader, out_writer)
+                    .await?;
+            }
+            Outbound::RevTcp(o) => {
+                let (out_reader, out_writer) = o.connect().await?;
                 self.process(in_reader, in_writer, out_reader, out_writer)
                     .await?;
             }

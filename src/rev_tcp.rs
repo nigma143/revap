@@ -1,13 +1,25 @@
-use std::{borrow::Borrow, cmp, collections::HashMap, io, net::SocketAddr, sync::{
+use std::{
+    borrow::Borrow,
+    cmp,
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    ops::Mul,
+    sync::{
         atomic::{AtomicU32, AtomicUsize},
-        Arc,
-    }, time::Duration};
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use log::{debug, error, info};
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
-    sync::mpsc::{self, error::TryRecvError, Receiver, Sender},
+    net::{TcpListener, TcpStream},
+    sync::{
+        mpsc::{self, channel, error::TryRecvError, Receiver, Sender},
+        oneshot,
+    },
 };
 
 use crate::pipe::{self, PipeReader, PipeWriter};
@@ -22,33 +34,39 @@ enum Frame {
 async fn read_frame<R: AsyncRead + Unpin>(mut read: R) -> io::Result<Frame> {
     let opcode = read.read_u8().await?;
     let frame = match opcode {
-        0x00 => {
-            let id = read.read_u32().await?;
-            let rem_w_size = read.read_u32().await?;
-
-            Frame::New { id, rem_w_size }
-        }
         0x01 => {
             let id = read.read_u32().await?;
-            let len = read.read_u32().await?;
-            let mut payload = Vec::new();
-            unsafe {
-                payload.set_len(len as usize);
-            }
-
-            read.read_exact(&mut payload).await?;
-
-            Frame::Content { id, payload }
+            let rem_w_size = read.read_u32().await?;
+            debug!("recv new frame - id: {}, rem_w_size: {}", id, rem_w_size);
+            Frame::New { id, rem_w_size }
         }
         0x02 => {
             let id = read.read_u32().await?;
-            let remaining = read.read_u32().await?;
-
-            Frame::ContentProcessed { id, remaining }
+            let len = read.read_u32().await? as usize;
+            let mut payload = Vec::with_capacity(len);
+            unsafe {
+                payload.set_len(len);
+            }
+            read.read_exact(&mut payload).await?;
+            debug!(
+                "recv content frame - id: {}, payload_len: {}",
+                id,
+                payload.len()
+            );
+            Frame::Content { id, payload }
         }
         0x03 => {
             let id = read.read_u32().await?;
-
+            let remaining = read.read_u32().await?;
+            debug!(
+                "recv content processed frame - id: {}, remaining: {}",
+                id, remaining
+            );
+            Frame::ContentProcessed { id, remaining }
+        }
+        0x04 => {
+            let id = read.read_u32().await?;
+            debug!("recv terminated frame - id: {}", id);
             Frame::Terminated { id }
         }
         _ => Err(io::Error::new(
@@ -66,21 +84,32 @@ async fn write_frame<W: AsyncWrite + Unpin>(mut write: W, value: Frame) -> io::R
             write.write_u8(0x01).await?;
             write.write_u32(id).await?;
             write.write_u32(rem_w_size).await?;
+            debug!("send new frame - id: {}, rem_w_size: {}", id, rem_w_size);
         }
         Frame::Content { id, payload } => {
             write.write_u8(0x02).await?;
             write.write_u32(id).await?;
             write.write_u32(payload.len() as u32).await?;
             write.write_all(&payload).await?;
+            debug!(
+                "send content frame - id: {}, payload_len: {}",
+                id,
+                payload.len()
+            );
         }
         Frame::ContentProcessed { id, remaining } => {
             write.write_u8(0x03).await?;
             write.write_u32(id).await?;
             write.write_u32(remaining).await?;
+            debug!(
+                "send content processed frame - id: {}, remaining: {}",
+                id, remaining
+            );
         }
         Frame::Terminated { id } => {
             write.write_u8(0x04).await?;
             write.write_u32(id).await?;
+            debug!("send terminated frame - id: {}", id);
         }
     }
 
@@ -110,9 +139,12 @@ impl Multiplexor {
         let (listen_tx, listen_rx) = mpsc::channel(1024);
 
         tokio::spawn(async move {
-            write_loop(write, message_rx).await.unwrap();
+            write_loop(write, message_rx).await
         });
-        tokio::spawn(async move { read_loop(read, message_tx_ref, connect_rx, listen_tx).await });
+        tokio::spawn(async move {
+            read_loop(read, message_tx_ref, connect_rx, listen_tx)
+                .await
+        });
 
         Self {
             message_tx,
@@ -120,10 +152,6 @@ impl Multiplexor {
             listen_rx,
             last_id: Arc::new(AtomicU32::new(0)),
         }
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.message_tx.is_closed() || self.connect_tx.is_closed()
     }
 
     pub async fn listen(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
@@ -142,12 +170,27 @@ impl Multiplexor {
         tokio::spawn(async move {
             output_conn_loop(message_tx, outcoming.id, read_out, outcoming.rem_w_size)
                 .await
-                .unwrap();
         });
 
         Ok((outcoming.rx, write_out))
     }
 
+    pub fn get_connector(&self) -> MultiplexorConnector {
+        MultiplexorConnector {
+            message_tx: self.message_tx.clone(),
+            connect_tx: self.connect_tx.clone(),
+            last_id: self.last_id.clone(),
+        }
+    }
+}
+
+pub struct MultiplexorConnector {
+    message_tx: Sender<Frame>,
+    connect_tx: Sender<Incoming>,
+    last_id: Arc<AtomicU32>,
+}
+
+impl MultiplexorConnector {
     pub async fn connect(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
         let id = self
             .last_id
@@ -259,7 +302,7 @@ where
     loop {
         match message_rx.recv().await {
             Some(msg) => {
-                write_frame(&mut write, msg.into()).await?;
+                write_frame(&mut write, msg).await?;
             }
             None => {
                 return Err(io::Error::new(
@@ -307,17 +350,19 @@ where
                     },
                 );
             }
-            Frame::Content { id, payload } => loop {
-                match connect_rx.try_recv() {
-                    Ok(c) => map.insert(c.id, c),
-                    Err(e) => match e {
-                        TryRecvError::Empty => break,
-                        TryRecvError::Disconnected => Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "listen channel is closed",
-                        ))?,
-                    },
-                };
+            Frame::Content { id, payload } => {
+                loop {
+                    match connect_rx.try_recv() {
+                        Ok(c) => map.insert(c.id, c),
+                        Err(e) => match e {
+                            TryRecvError::Empty => break,
+                            TryRecvError::Disconnected => Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "listen channel is closed",
+                            ))?,
+                        },
+                    };
+                }
                 match map.get_mut(&id) {
                     Some(c) => match c.tx.write_all(&payload).await {
                         Ok(_) => {
@@ -343,17 +388,17 @@ where
                     },
                     None => error!("unknown connect `{}`", id),
                 }
-            },
+            }
             Frame::ContentProcessed { id, remaining } => match map.get_mut(&id) {
                 Some(c) => {
                     c.rem_w_size
                         .store(remaining as usize, std::sync::atomic::Ordering::Relaxed);
                 }
-                None => error!("unknown connect `{}`", id),
+                None =>{} //error!("unknown connect `{}`", id),
             },
             Frame::Terminated { id } => match map.remove(&id) {
                 Some(c) => drop(c),
-                None => error!("unknown connect `{}`", id),
+                None => {}//error!("unknown connect `{}`", id),
             },
         }
     }
@@ -361,13 +406,59 @@ where
     unreachable!();
 }
 
+#[derive(Clone)]
 pub struct RevTcpConnector {
-
+    conn_tx: Sender<oneshot::Sender<io::Result<MultiplexorConnector>>>,
 }
 
 impl RevTcpConnector {
     pub fn bind(addr: SocketAddr) -> Self {
-        
+        let pool: Arc<Mutex<Vec<Multiplexor>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut pool_ref = pool.clone();
+        let (conn_tx, mut conn_rx) = channel(1024);
+
+        tokio::spawn(async move {
+            let mut index = 0;
+            loop {
+                let rq: oneshot::Sender<io::Result<MultiplexorConnector>> =
+                    conn_rx.recv().await.unwrap();
+                let pool = pool.lock().unwrap();
+
+                if pool.is_empty() {
+                    rq.send(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "no incoming connection",
+                    )));
+                    continue;
+                }
+
+                if pool.len() - 1 < index {
+                    index = 0;
+                }
+
+                let mux = pool.get(index).unwrap();
+                rq.send(Ok(mux.get_connector()));
+
+                index += 1;
+            }
+        });
+
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(addr).await.unwrap();
+            while let Ok((stream, _)) = listener.accept().await {
+                let mux = Multiplexor::new(stream);
+                pool_ref.lock().unwrap().push(mux);
+            }
+        });
+
+        Self { conn_tx }
+    }
+
+    pub async fn connect(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
+        let (tx, rx) = oneshot::channel();
+        self.conn_tx.send(tx).await;
+        let pipe = rx.await.unwrap()?.connect().await?;
+        Ok(pipe)
     }
 }
 
@@ -388,7 +479,7 @@ impl RevTcpListener {
                     Ok(o) => {
                         info!("connected to `{}`", self.addr);
                         o
-                    },
+                    }
                     Err(e) => {
                         error!("error on connect to `{}`. detail: {}", self.addr, e);
                         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -404,11 +495,15 @@ impl RevTcpListener {
                 Ok(o) => {
                     debug!("incoming mux channel from `{}`", self.addr);
                     o
-                },
+                }
                 Err(e) => {
-                    error!("error on listen mux channel from `{}`. detail: {}", self.addr, e);
+                    error!(
+                        "error on listen mux channel from `{}`. detail: {}",
+                        self.addr, e
+                    );
+                    self.mux = None;
                     continue;
-                },
+                }
             };
 
             return Ok(res);
