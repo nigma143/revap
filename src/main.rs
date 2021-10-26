@@ -1,15 +1,18 @@
 use std::{env, net::SocketAddr};
 
+use tokio::io;
+
 use crate::{
-    inbound::{inbound_revtcp, inbound_tcp},
+    inbound::inbound_tcp,
     outbound::{Outbound, TcpOutbound, TlsOutbound},
-    rev_tcp::RevTcpConnector,
+    revtcp_bound::{inbound_revtcp, RevTcpOutbound},
 };
 
 mod inbound;
+mod multiplexor;
 mod outbound;
 mod pipe;
-mod rev_tcp;
+mod revtcp_bound;
 
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{:?}", args);
     if args.len() > 1 {
         let addr1 = SocketAddr::from(([127, 0, 0, 1], 4001));
-        let outbounds = vec![Outbound::Tcp(TcpOutbound::new(
+        let outbounds = vec![Outbound::Tls(TlsOutbound::new(
             "127.0.0.1:8080".to_string().parse().unwrap(),
         ))];
 
@@ -27,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let addr1 = SocketAddr::from(([127, 0, 0, 1], 5001));
 
-        let rev = RevTcpConnector::bind(SocketAddr::from(([127, 0, 0, 1], 4001)));
+        let rev = RevTcpOutbound::bind(SocketAddr::from(([127, 0, 0, 1], 4001)));
 
         let outbounds = vec![Outbound::RevTcp(rev)];
 

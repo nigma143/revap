@@ -1,15 +1,11 @@
 use std::{
-    borrow::Borrow,
     cmp,
     collections::HashMap,
     io,
-    net::SocketAddr,
-    ops::Mul,
     sync::{
         atomic::{AtomicU32, AtomicUsize},
-        Arc, Mutex,
+        Arc,
     },
-    time::Duration,
 };
 
 use log::{debug, error, info};
@@ -24,11 +20,13 @@ use tokio::{
 
 use crate::pipe::{self, PipeReader, PipeWriter};
 
+pub type ChannelId = u32;
+
 enum Frame {
-    New { id: u32, rem_w_size: u32 },
-    Content { id: u32, payload: Vec<u8> },
-    ContentProcessed { id: u32, remaining: u32 },
-    Terminated { id: u32 },
+    New { id: ChannelId, rem_w_size: u32 },
+    Content { id: ChannelId, payload: Vec<u8> },
+    ContentProcessed { id: ChannelId, remaining: u32 },
+    Terminated { id: ChannelId },
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(mut read: R) -> io::Result<Frame> {
@@ -138,13 +136,8 @@ impl Multiplexor {
         let (connect_tx, connect_rx) = mpsc::channel(1024);
         let (listen_tx, listen_rx) = mpsc::channel(1024);
 
-        tokio::spawn(async move {
-            write_loop(write, message_rx).await
-        });
-        tokio::spawn(async move {
-            read_loop(read, message_tx_ref, connect_rx, listen_tx)
-                .await
-        });
+        tokio::spawn(async move { write_loop(write, message_rx).await });
+        tokio::spawn(async move { read_loop(read, message_tx_ref, connect_rx, listen_tx).await });
 
         Self {
             message_tx,
@@ -154,7 +147,7 @@ impl Multiplexor {
         }
     }
 
-    pub async fn listen(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
+    pub async fn listen(&mut self) -> io::Result<(ChannelId, PipeReader, PipeWriter)> {
         let outcoming = self.listen_rx.recv().await.ok_or(io::Error::new(
             io::ErrorKind::Other,
             "listen channel is die",
@@ -168,11 +161,14 @@ impl Multiplexor {
         let message_tx = self.message_tx.clone();
 
         tokio::spawn(async move {
-            output_conn_loop(message_tx, outcoming.id, read_out, outcoming.rem_w_size)
-                .await
+            output_conn_loop(message_tx, outcoming.id, read_out, outcoming.rem_w_size).await
         });
 
-        Ok((outcoming.rx, write_out))
+        Ok((outcoming.id, outcoming.rx, write_out))
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.message_tx.is_closed() || self.connect_tx.is_closed()
     }
 
     pub fn get_connector(&self) -> MultiplexorConnector {
@@ -191,7 +187,7 @@ pub struct MultiplexorConnector {
 }
 
 impl MultiplexorConnector {
-    pub async fn connect(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
+    pub async fn connect(&mut self) -> io::Result<(ChannelId, PipeReader, PipeWriter)> {
         let id = self
             .last_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -226,10 +222,9 @@ impl MultiplexorConnector {
         tokio::spawn(async move {
             output_conn_loop(message_tx, id, read_out, w_size)
                 .await
-                .unwrap();
         });
 
-        Ok((read_in, write_out))
+        Ok((id, read_in, write_out))
     }
 }
 
@@ -386,7 +381,7 @@ where
                                 })?;
                         }
                     },
-                    None => error!("unknown connect `{}`", id),
+                    None => {}
                 }
             }
             Frame::ContentProcessed { id, remaining } => match map.get_mut(&id) {
@@ -394,119 +389,14 @@ where
                     c.rem_w_size
                         .store(remaining as usize, std::sync::atomic::Ordering::Relaxed);
                 }
-                None =>{} //error!("unknown connect `{}`", id),
+                None => {}
             },
             Frame::Terminated { id } => match map.remove(&id) {
                 Some(c) => drop(c),
-                None => {}//error!("unknown connect `{}`", id),
+                None => {}
             },
         }
     }
 
     unreachable!();
-}
-
-#[derive(Clone)]
-pub struct RevTcpConnector {
-    conn_tx: Sender<oneshot::Sender<io::Result<MultiplexorConnector>>>,
-}
-
-impl RevTcpConnector {
-    pub fn bind(addr: SocketAddr) -> Self {
-        let pool: Arc<Mutex<Vec<Multiplexor>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut pool_ref = pool.clone();
-        let (conn_tx, mut conn_rx) = channel(1024);
-
-        tokio::spawn(async move {
-            let mut index = 0;
-            loop {
-                let rq: oneshot::Sender<io::Result<MultiplexorConnector>> =
-                    conn_rx.recv().await.unwrap();
-                let pool = pool.lock().unwrap();
-
-                if pool.is_empty() {
-                    rq.send(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "no incoming connection",
-                    )));
-                    continue;
-                }
-
-                if pool.len() - 1 < index {
-                    index = 0;
-                }
-
-                let mux = pool.get(index).unwrap();
-                rq.send(Ok(mux.get_connector()));
-
-                index += 1;
-            }
-        });
-
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(addr).await.unwrap();
-            while let Ok((stream, _)) = listener.accept().await {
-                let mux = Multiplexor::new(stream);
-                pool_ref.lock().unwrap().push(mux);
-            }
-        });
-
-        Self { conn_tx }
-    }
-
-    pub async fn connect(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
-        let (tx, rx) = oneshot::channel();
-        self.conn_tx.send(tx).await;
-        let pipe = rx.await.unwrap()?.connect().await?;
-        Ok(pipe)
-    }
-}
-
-pub struct RevTcpListener {
-    addr: SocketAddr,
-    mux: Option<Multiplexor>,
-}
-
-impl RevTcpListener {
-    pub fn bind(addr: SocketAddr) -> Self {
-        Self { addr, mux: None }
-    }
-
-    pub async fn accept(&mut self) -> io::Result<(PipeReader, PipeWriter)> {
-        loop {
-            if self.mux.is_none() {
-                let stream = match TcpStream::connect(self.addr).await {
-                    Ok(o) => {
-                        info!("connected to `{}`", self.addr);
-                        o
-                    }
-                    Err(e) => {
-                        error!("error on connect to `{}`. detail: {}", self.addr, e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
-                self.mux = Some(Multiplexor::new(stream));
-            }
-
-            let mux = self.mux.as_mut().unwrap();
-
-            let res = match mux.listen().await {
-                Ok(o) => {
-                    debug!("incoming mux channel from `{}`", self.addr);
-                    o
-                }
-                Err(e) => {
-                    error!(
-                        "error on listen mux channel from `{}`. detail: {}",
-                        self.addr, e
-                    );
-                    self.mux = None;
-                    continue;
-                }
-            };
-
-            return Ok(res);
-        }
-    }
 }

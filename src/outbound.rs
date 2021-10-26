@@ -8,7 +8,7 @@ use tokio::{
 };
 use tokio_rustls::client::TlsStream;
 
-use crate::rev_tcp::RevTcpConnector;
+use crate::revtcp_bound::RevTcpOutbound;
 
 pub enum Incoming<R, W> {
     Tcp {
@@ -22,7 +22,7 @@ pub enum Incoming<R, W> {
 pub enum Outbound {
     Tcp(TcpOutbound),
     Tls(TlsOutbound),
-    RevTcp(RevTcpConnector),
+    RevTcp(RevTcpOutbound),
 }
 
 impl fmt::Display for Outbound {
@@ -61,7 +61,7 @@ impl Outbound {
                     .await?;
             }
             Outbound::RevTcp(o) => {
-                let (out_reader, out_writer) = o.connect().await?;
+                let (_, out_reader, out_writer) = o.connect().await?;
                 self.process(in_reader, in_writer, out_reader, out_writer)
                     .await?;
             }
