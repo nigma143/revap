@@ -1,18 +1,14 @@
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, path::Path};
 
 use tokio::io;
 
-use crate::{
-    inbound::inbound_tcp,
-    outbound::{Outbound, TcpOutbound, TlsOutbound},
-    revtcp_bound::{inbound_revtcp, RevTcpOutbound},
-};
+use crate::{outbound::Outbound, revtcp_bound::{inbound_revtcp, RevTcpOutbound}, tcp_bound::{TlsOutbound, inbound_tcp, inbound_tls}};
 
-mod inbound;
 mod multiplexor;
 mod outbound;
 mod pipe;
 mod revtcp_bound;
+mod tcp_bound;
 
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let outbounds = vec![Outbound::RevTcp(rev)];
 
+        //inbound_tls(addr1, Path::new("testdata/cert.pem"), Path::new("testdata/key.pem"), outbounds).await?;
         inbound_tcp(addr1, outbounds).await?;
     }
 

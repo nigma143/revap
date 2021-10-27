@@ -8,13 +8,11 @@ use std::{
     },
 };
 
-use log::{debug, error, info};
+use log::*;
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
     sync::{
-        mpsc::{self, channel, error::TryRecvError, Receiver, Sender},
-        oneshot,
+        mpsc::{self, error::TryRecvError, Receiver, Sender},
     },
 };
 
@@ -219,10 +217,7 @@ impl MultiplexorConnector {
 
         let message_tx = self.message_tx.clone();
 
-        tokio::spawn(async move {
-            output_conn_loop(message_tx, id, read_out, w_size)
-                .await
-        });
+        tokio::spawn(async move { output_conn_loop(message_tx, id, read_out, w_size).await });
 
         Ok((id, read_in, write_out))
     }
@@ -274,8 +269,6 @@ async fn output_conn_loop(
             }
         };
     }
-
-    unreachable!();
 }
 
 struct Incoming {
@@ -307,8 +300,6 @@ where
             }
         }
     }
-
-    unreachable!();
 }
 
 async fn read_loop<R>(
@@ -397,6 +388,4 @@ where
             },
         }
     }
-
-    unreachable!();
 }
