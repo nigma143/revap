@@ -5,6 +5,8 @@ use std::{
     time::Duration,
 };
 
+use std::ops::DerefMut;
+
 use log::{debug, error, info};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -15,15 +17,11 @@ use tokio::{
     },
 };
 
-use crate::{
-    multiplexor::{ChannelId, Multiplexor, MultiplexorConnector},
-    outbound::{io_process, Incoming, Outbound},
-    pipe::{PipeReader, PipeWriter},
-};
+use crate::{multiplexor::{ChannelId, Multiplexor, MultiplexorConnector, MuxConnector, MuxListener, PipeTerminator}, outbound::{io_process, Incoming, Outbound}, pipe::{PipeReader, PipeWriter}};
 
 struct RevTcpListener {
     addr: SocketAddr,
-    mux: Option<Multiplexor>,
+    mux: Option<MuxListener>,
 }
 
 impl RevTcpListener {
@@ -45,7 +43,7 @@ impl RevTcpListener {
                         continue;
                     }
                 };
-                self.mux = Some(Multiplexor::new(stream));
+                self.mux = Some(MuxListener::new(stream));
             }
 
             let mux = self.mux.as_mut().unwrap();
@@ -73,19 +71,19 @@ impl RevTcpListener {
 #[derive(Clone)]
 pub struct RevTcpOutbound {
     addr: SocketAddr,
-    conn_tx: Sender<oneshot::Sender<io::Result<(SocketAddr, MultiplexorConnector)>>>,
+    conn_tx: Sender<oneshot::Sender<io::Result<(SocketAddr, MuxConnector)>>>,
 }
 
 impl RevTcpOutbound {
     pub fn bind(addr: SocketAddr) -> Self {
-        let pool: Arc<Mutex<Vec<(SocketAddr, Multiplexor)>>> = Arc::new(Mutex::new(Vec::new()));
+        let pool: Arc<Mutex<Vec<(SocketAddr, MuxConnector)>>> = Arc::new(Mutex::new(Vec::new()));
         let pool_ref = pool.clone();
         let (conn_tx, mut conn_rx) = channel(1024);
 
         tokio::spawn(async move {
             let mut index = 0;
             loop {
-                let rq: oneshot::Sender<io::Result<(SocketAddr, MultiplexorConnector)>> =
+                let rq: oneshot::Sender<io::Result<(SocketAddr, MuxConnector)>> =
                     conn_rx.recv().await.unwrap();
                 let mut pool = pool.lock().unwrap();
 
@@ -104,7 +102,7 @@ impl RevTcpOutbound {
                 }
 
                 let item = pool.get(index).unwrap();
-                rq.send(Ok((item.0, item.1.get_connector())));
+                rq.send(Ok((item.0, item.1.clone())));
 
                 index += 1;
             }
@@ -114,7 +112,7 @@ impl RevTcpOutbound {
             let listener = TcpListener::bind(addr).await.unwrap();
             while let Ok((stream, rem_addr)) = listener.accept().await {
                 info!("incoming connection for {} from {}", addr, rem_addr);
-                let mux = Multiplexor::new(stream);
+                let mux = MuxConnector::new(stream);
                 pool_ref.lock().unwrap().push((rem_addr, mux));
             }
         });
@@ -122,7 +120,7 @@ impl RevTcpOutbound {
         Self { addr, conn_tx }
     }
 
-    async fn connect(&mut self) -> io::Result<(SocketAddr, (ChannelId, PipeReader, PipeWriter))> {
+    async fn connect(&mut self) -> io::Result<(SocketAddr, (ChannelId, PipeTerminator<PipeReader>, PipeTerminator<PipeWriter>))> {
         let (tx, rx) = oneshot::channel();
         self.conn_tx
             .send(tx)
@@ -147,15 +145,15 @@ impl RevTcpOutbound {
         };
 
         match self.connect().await {
-            Ok((addr, (id, or, ow))) => {
-                debug!("forwarding {} --> REVTCP({}/{})", source, addr, id);
-                match io_process(ir, iw, or, ow).await {
+            Ok((addr, (id, mut or, mut ow))) => {
+                debug!("forwarding {} --> REVTCP({}/{})", source, addr, id);                
+                match io_process(ir, iw, or.deref_mut(), ow.deref_mut()).await {
                     Ok(_) => {}
                     Err(e) => error!(
                         "error at process {} --> REVTCP({}/{}). detail: {}",
                         source, addr, id, e
                     ),
-                }
+                };
             }
             Err(e) => error!(
                 "error at connect over REVTCP(listen: {}) for {}. detail: {}",

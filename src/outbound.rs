@@ -1,9 +1,7 @@
-use std::{io};
+use std::io;
 
 use log::*;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     revtcp_bound::RevTcpOutbound,
@@ -60,10 +58,11 @@ where
             }
             ow.write_all(&buf[0..n]).await?;
         }
+        //tokio::io::copy(&mut ir, &mut ow).await?;
         ow.shutdown().await
     };
 
-    let server_to_client = async {        
+    let server_to_client = async {
         let mut buf = vec![0; 2 * 1024].into_boxed_slice();
         loop {
             let n = or.read(&mut buf).await?;
@@ -72,6 +71,7 @@ where
             }
             iw.write_all(&buf[0..n]).await?;
         }
+        //tokio::io::copy(&mut or, &mut iw).await?;
         iw.shutdown().await
     };
 

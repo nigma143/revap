@@ -16,3 +16,4 @@ rustls = { version = "0.20.0", features = ["dangerous_configuration"] }
 tokio-rustls = { git = "https://github.com/tokio-rs/tls", branch = "master" }
 rustls-pemfile = "0.2.1"
 bytes = "1.1.0"
+id-pool = { git = "https://github.com/nigma143/id-pool", default-features = false, features = ["u32"] }

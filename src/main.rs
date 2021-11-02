@@ -1,8 +1,13 @@
 use std::{env, net::SocketAddr, path::Path};
 
+use id_pool::IdPool;
 use tokio::io;
 
-use crate::{outbound::Outbound, revtcp_bound::{inbound_revtcp, RevTcpOutbound}, tcp_bound::{TlsOutbound, inbound_tcp, inbound_tls}};
+use crate::{
+    outbound::Outbound,
+    revtcp_bound::{inbound_revtcp, RevTcpOutbound},
+    tcp_bound::{inbound_tcp, inbound_tls, TcpOutbound, TlsOutbound},
+};
 
 mod multiplexor;
 mod outbound;
@@ -12,7 +17,7 @@ mod tcp_bound;
 
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
 
     let args: Vec<String> = env::args().collect();
     println!("{:?}", args);
@@ -23,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))];
 
         inbound_revtcp(addr1, outbounds).await?;
+        //inbound_tcp(addr1, outbounds).await?;
     } else {
         let addr1 = SocketAddr::from(([127, 0, 0, 1], 5001));
 
