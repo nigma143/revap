@@ -130,11 +130,11 @@ impl TlsOutbound {
 
         match self.connect().await {
             Ok((or, ow)) => {
-                debug!("forwarding {} --> TCP({})", source, self.addr);
+                debug!("forwarding {} --> TLS({})", source, self.addr);
                 match io_process(ir, iw, or, ow).await {
                     Ok(_) => {}
                     Err(e) => error!(
-                        "error at process {} --> TCP({}). detail: {}",
+                        "error at process {} --> TLS({}). detail: {}",
                         source, self.addr, e
                     ),
                 }
@@ -210,7 +210,7 @@ pub async fn inbound_tls(
                     let (reader, writer) = split(stream);
                     outbound
                         .forwarding(Incoming::Stream {
-                            source: format!("TCP({}/{})", addr, rem_addr),
+                            source: format!("TLS({}/{})", addr, rem_addr),
                             reader,
                             writer,
                         })
