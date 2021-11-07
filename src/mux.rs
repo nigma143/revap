@@ -6,7 +6,7 @@ use std::{
 };
 
 use id_pool::IdPool;
-use log::debug;
+use log::{debug, info};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
@@ -127,7 +127,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(mut write: W, value: Frame) -> io::R
                 return Err(io::Error::new(io::ErrorKind::Other, "payload too large"));
             }
             write.write_u8(0x02).await?;
-            write.write_i32(id.into()).await?;            
+            write.write_i32(id.into()).await?;
             write.write_u32(payload.len() as u32).await?;
             write.write_all(&payload).await?;
         }
@@ -240,7 +240,9 @@ impl MuxConnector {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "rx new channel is die"))?;
 
-        let channel = in_rx.await.unwrap();
+        let channel = in_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "rx connect channel is die"))?;
 
         let w_size = channel
             .rem_w_size
@@ -294,10 +296,11 @@ async fn mux_write_loop(
     mut writer: PipeWriter,
 ) -> io::Result<()> {
     loop {
-        let content = channel.reader.recv().await.ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "rx read content channel is die",
-        ))?;
+        let content = channel
+            .reader
+            .recv()
+            .await
+            .ok_or(io_err("rx read content channel is die"))?;
         match content {
             ReadContent::Payload(payload) => {
                 loop {
@@ -305,13 +308,12 @@ async fn mux_write_loop(
                     if channel.w_size >= payload.len() {
                         break;
                     }
-                    println!("dgfdsfds");
                     tokio::task::yield_now().await;
                 }
                 if let Err(_) = writer.write_all(&payload[..]).await {
-                    term.send(channel.id).await.map_err(|_| {
-                        io::Error::new(io::ErrorKind::Other, "rx term channel is die")
-                    })?;
+                    term.send(channel.id)
+                        .await
+                        .map_err(|_| io_err("rx term channel is die"))?;
                 }
                 channel.w_size -= payload.len();
                 if channel.w_size < NOTIFY_AFTER_WIN_SIZE {
@@ -322,9 +324,7 @@ async fn mux_write_loop(
                             remaining: channel.w_size as u32,
                         })
                         .await
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "rx frame channel is die")
-                        })?;
+                        .map_err(|_| io_err("rx frame channel is die"))?;
                 }
             }
             ReadContent::Terminated => {
@@ -361,12 +361,12 @@ async fn mux_read_loop(
                         payload: buf[0..n].to_vec(),
                     })
                     .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "rx frame channel is die"))?;
+                    .map_err(|_| io_err("rx frame channel is die"))?;
             }
             _ => {
                 term.send(channel.id)
                     .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "rx term channel is die"))?;
+                    .map_err(|_| io_err("rx term channel is die"))?;
                 return Ok(());
             }
         }
@@ -378,10 +378,10 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
-        let frame = message_rx.recv().await.ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "tx frame channel is die",
-        ))?;
+        let frame = message_rx
+            .recv()
+            .await
+            .ok_or(io_err("tx frame channel is die"))?;
         debug!("<- {}", frame);
         write_frame(&mut write, frame).await?;
     }
@@ -405,9 +405,10 @@ where
         loop {
             let frame = read_frame(&mut read).await?;
             debug!("-> {}", frame);
-            r_frame_tx.send(frame).await.map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "rx read frame channel is die")
-            })?;
+            r_frame_tx
+                .send(frame)
+                .await
+                .map_err(|_| io_err("rx read frame channel is die"))?;
         }
         io::Result::Ok(())
     });
@@ -418,7 +419,7 @@ where
                 match res {
                     Some(shot) => {
                         let id = ChannelId::Local(ids_pool.request_id().unwrap());
-                        let (wi, ri) = mpsc::channel(1024);
+                        let (wi, ri) = mpsc::channel(32);
                         let rem_w_size = Arc::new(AtomicUsize::new(REM_WIN_SIZE));
                         map.insert(
                             id,
@@ -435,15 +436,13 @@ where
                                 rem_w_size: REM_WIN_SIZE as u32,
                             })
                             .await
-                            .map_err(|_| {
-                                io::Error::new(io::ErrorKind::Other, "rx write frame channel is die")
-                            })?;
+                            .map_err(|_| io_err("rx write frame channel is die"))?;
                         shot.send(ChannelRx {
                             id,
                             reader: ri,
                             rem_w_size: rem_w_size.clone(),
                         })
-                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "rx new channel is die"))?;
+                        .map_err(|_| io_err("rx new channel is die"))?;
                     }
                     None => break,
                 }
@@ -451,20 +450,21 @@ where
             res = term.recv() => {
                 match res {
                     Some(id) => {
-                        let channel = map.get_mut(&id).unwrap();
-                        match channel.state {
-                            ChannelState::Established => {
-                                channel.state = ChannelState::FinWait;
-                            },
-                            ChannelState::FinWait => {
-                                map.remove(&id).unwrap();
-                                if let ChannelId::Local(id) = id {
-                                    ids_pool.return_id(id).unwrap();
+                        if let Some(channel) = map.get_mut(&id) {
+                            match channel.state {
+                                ChannelState::Established => {
+                                    channel.state = ChannelState::FinWait;
+                                },
+                                ChannelState::FinWait => {
+                                    map.remove(&id).unwrap();
+                                    if let ChannelId::Local(id) = id {
+                                        ids_pool.return_id(id).unwrap();
+                                    }
                                 }
-                            }
-                        };
-                        w_frame.send(Frame::Terminated { id }).await
-                            .map_err(|_| { io::Error::new(io::ErrorKind::Other,"rx write frame channel is die",)})?;
+                            };
+                            w_frame.send(Frame::Terminated { id }).await
+                                .map_err(|_| io_err("rx write frame channel is die"))?;
+                        }
                     },
                     None => break,
                 }
@@ -482,9 +482,7 @@ where
                                     rem_w_size: rem_w_size.clone(),
                                 })
                                 .await
-                                .map_err(|_| {
-                                    io::Error::new(io::ErrorKind::Other, "rx listen channel is die")
-                                })?;
+                                .map_err(|_| io_err("rx listen channel is die"))?;
                             map.insert(
                                 id,
                                 ChannelTx {
@@ -500,29 +498,30 @@ where
                                 Ok(_) => {
                                 }
                                 Err(e) => {
-                                    debug!("id: {} pipe reader is die. {}", id, e);
+                                    info!("id: {} pipe reader is die. {}", id, e);
                                 }
                             },
-                            None => debug!("id: {} not found", id),
+                            None => info!("id: {} not found", id),
                         },
                         Frame::ContentProcessed { id, remaining } => match map.get_mut(&id) {
                             Some(c) => {
                                 c.rem_w_size
                                     .store(remaining as usize, std::sync::atomic::Ordering::Relaxed);
                             }
-                            None => debug!("id: {} not found", id),
+                            None => info!("id: {} not found", id),
                         },
                         Frame::Terminated { id } => {
-                            let channel = map.get_mut(&id).unwrap();
-                            match channel.state {
-                                ChannelState::Established => {
-                                    channel.state = ChannelState::FinWait;
-                                    let _ = channel.writer.send(ReadContent::Terminated).await;
-                                }
-                                ChannelState::FinWait => {
-                                    map.remove(&id).unwrap();
-                                    if let ChannelId::Local(id) = id {
-                                        ids_pool.return_id(id).unwrap();
+                            if let Some(channel) = map.get_mut(&id) {
+                                match channel.state {
+                                    ChannelState::Established => {
+                                        channel.state = ChannelState::FinWait;
+                                        let _ = channel.writer.send(ReadContent::Terminated).await;
+                                    }
+                                    ChannelState::FinWait => {
+                                        map.remove(&id).unwrap();
+                                        if let ChannelId::Local(id) = id {
+                                            ids_pool.return_id(id).unwrap();
+                                        }
                                     }
                                 }
                             }
@@ -557,4 +556,8 @@ struct ChannelRx {
 enum ChannelState {
     Established,
     FinWait,
+}
+
+fn io_err(detail: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, detail)
 }
