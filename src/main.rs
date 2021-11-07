@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{:?}", args);
     if args.len() > 1 {
         let addr1 = SocketAddr::from(([127, 0, 0, 1], 4001));
-        let outbounds = vec![Outbound::Tcp(TcpOutbound::new(
+        let outbounds = vec![Outbound::Tls(TlsOutbound::new(
             "127.0.0.1:8080".to_string().parse().unwrap(),
         ))];
 
