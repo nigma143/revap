@@ -17,6 +17,40 @@ pub fn new_pipe(max_buf_size: usize) -> (PipeWriter, PipeReader) {
     )
 }
 
+pub fn new_pipe2(max_buf_size: usize) -> (PipeArbiter, PipeWriter, PipeReader) {
+    let pipe = Arc::new(Mutex::new(Pipe::new(max_buf_size)));
+
+    (
+        PipeArbiter { pipe: pipe.clone() },
+        PipeWriter {
+            write: pipe.clone(),
+        },
+        PipeReader { read: pipe },
+    )
+}
+
+pub struct PipeArbiter {
+    pipe: Arc<Mutex<Pipe>>,
+}
+
+impl PipeArbiter {
+    pub fn close(&mut self) {
+        let mut pipe = self.pipe.lock().unwrap();
+        pipe.close_write();
+        pipe.close_read();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.pipe.lock().unwrap().is_closed
+    }
+}
+
+impl Drop for PipeArbiter {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 #[derive(Debug)]
 pub struct PipeReader {
     read: Arc<Mutex<Pipe>>,
@@ -25,6 +59,10 @@ pub struct PipeReader {
 impl PipeReader {
     pub fn remaining(&self) -> usize {
         self.read.lock().unwrap().remaining()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.read.lock().unwrap().is_closed
     }
 }
 
@@ -58,6 +96,10 @@ pub struct PipeWriter {
 impl PipeWriter {
     pub fn remaining(&self) -> usize {
         self.write.lock().unwrap().remaining()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.write.lock().unwrap().is_closed
     }
 }
 

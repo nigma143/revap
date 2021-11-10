@@ -9,7 +9,7 @@ use crate::{
     tcp_bound::{inbound_tcp, inbound_tls, TcpOutbound, TlsOutbound},
 };
 
-mod mux;
+pub mod mux;
 mod outbound;
 mod pipe;
 mod revtcp_bound;
@@ -17,7 +17,7 @@ mod tcp_bound;
 
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let args: Vec<String> = env::args().collect();
     println!("{:?}", args);
