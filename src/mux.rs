@@ -165,8 +165,8 @@ async fn read_frame<R: AsyncRead + Unpin>(mut read: R) -> io::Result<Frame> {
 }
 
 pub struct MuxConnection {
-    listen: Receiver<ChannelRx>,
-    new: Sender<oneshot::Sender<ChannelRx>>,
+    listen: Receiver<Channel>,
+    new: Sender<oneshot::Sender<Channel>>,
 }
 
 impl MuxConnection {
@@ -191,11 +191,10 @@ impl MuxConnection {
     }
 
     pub async fn accept(&mut self) -> io::Result<(ChannelId, PipeReader, PipeWriter)> {
-        let channel = self
-            .listen
-            .recv()
-            .await
-            .ok_or(io_err("can't accept channel because transport is die"))?;
+        let channel = self.listen.recv().await.ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "can't accept channel because transport is die",
+        ))?;
 
         Ok((channel.id, channel.ri, channel.wo))
     }
@@ -212,21 +211,26 @@ impl MuxConnection {
 }
 
 pub struct MuxConnector {
-    new: Sender<oneshot::Sender<ChannelRx>>,
+    new: Sender<oneshot::Sender<Channel>>,
 }
 
 impl MuxConnector {
     pub async fn connect(&mut self) -> io::Result<(ChannelId, PipeReader, PipeWriter)> {
         let (in_tx, in_rx) = oneshot::channel();
 
-        self.new
-            .send(in_tx)
-            .await
-            .map_err(|_| io_err("can't create channel because transport is die"))?;
+        self.new.send(in_tx).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "can't create channel because transport is die",
+            )
+        })?;
 
-        let channel = in_rx
-            .await
-            .map_err(|_| io_err("error at connecting because transport is die"))?;
+        let channel = in_rx.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "error at connecting because transport is die",
+            )
+        })?;
 
         Ok((channel.id, channel.ri, channel.wo))
     }
@@ -235,8 +239,8 @@ impl MuxConnector {
 async fn connection_loop<R, W>(
     mut write: W,
     mut read: R,
-    listen: Sender<ChannelRx>,
-    mut new: Receiver<oneshot::Sender<ChannelRx>>,
+    listen: Sender<Channel>,
+    mut new: Receiver<oneshot::Sender<Channel>>,
 ) -> Result<(), Box<dyn Error>>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -245,11 +249,11 @@ where
     let mut map = HashMap::new();
     let mut ids_pool = IdPool::new();
 
-    let (w_frame_tx, mut w_frame_rx) = mpsc::channel(1024);
+    let (output_tx, mut output_rx) = mpsc::channel(1024);
     tokio::spawn(async move {
         if let Err(e) = async move {
             loop {
-                match w_frame_rx.recv().await {
+                match output_rx.recv().await {
                     Some(frame) => {
                         debug!("<- {}", frame);
                         write_frame(&mut write, frame).await?;
@@ -265,13 +269,13 @@ where
         }
     });
 
-    let (r_frame_tx, mut r_frame_rx) = mpsc::channel(1024);
+    let (input_tx, mut input_rx) = mpsc::channel(1024);
     tokio::spawn(async move {
         if let Err(e) = async move {
             loop {
                 let frame = read_frame(&mut read).await?;
                 debug!("-> {}", frame);
-                r_frame_tx.send(frame).await?;
+                input_tx.send(frame).await?;
             }
             Result::<(), Box<dyn Error>>::Ok(())
         }
@@ -285,23 +289,23 @@ where
         id: ChannelId,
         w_size: usize,
         rem_w_size: Arc<AtomicUsize>,
-    ) -> (ChannelTx, PipeReader, ChannelRx) {
+    ) -> (ChannelInner, PipeReader, Channel) {
         let (ai, wi, ri) = pipe::new_pipe2(w_size);
         let (ao, wo, ro) = pipe::new_pipe2(w_size);
         (
-            ChannelTx {
+            ChannelInner {
                 id,
                 input_arbiter: ai,
                 output_arbiter: ao,
-                mux_writer: wi,
-                mux_writer_processed: 0,
-                rem_w_size: rem_w_size.clone(),
+                mux_input: wi,
+                mux_input_processed: 0,
+                mux_output_w_size: rem_w_size.clone(),
                 read_flag: true,
                 rem_write_flag: true,
                 rem_read_flag: true,
             },
             ro,
-            ChannelRx { id, wo, ri },
+            Channel { id, wo, ri },
         )
     }
 
@@ -314,9 +318,9 @@ where
                         let rem_w_size = Arc::new(AtomicUsize::new(REM_WIN_SIZE));
                         let (channel_tx, ro, channel_rx) = crate_channel(id, REM_WIN_SIZE, rem_w_size.clone());
                         if let Ok(_) = shot.send(channel_rx) {
-                            spawn_mux_read(id, rem_w_size.clone(), ro, w_frame_tx.clone()); //
+                            spawn_mux_read(id, ro, output_tx.clone(), rem_w_size.clone()); //
                             map.insert(id, channel_tx);
-                            w_frame_tx
+                            output_tx
                                 .send(Frame::New {
                                     id,
                                     rem_w_size: REM_WIN_SIZE as u32,
@@ -327,79 +331,69 @@ where
                     None => break,
                 }
             },
-            res = r_frame_rx.recv() => {
+            res = input_rx.recv() => {
                 match res {
                     Some(frame) => match frame {
                         Frame::New { id, rem_w_size } => {
                             let rem_w_size = Arc::new(AtomicUsize::new(rem_w_size as usize));
                             let (channel_tx, ro, channel_rx) = crate_channel(id, REM_WIN_SIZE, rem_w_size.clone());
-                            spawn_mux_read(id, rem_w_size.clone(), ro, w_frame_tx.clone());
+                            spawn_mux_read(id, ro, output_tx.clone(), rem_w_size.clone());
                             listen.send(channel_rx).await?;
                             map.insert(id, channel_tx);
                         }
-                        Frame::Content { id, payload } => match map.get_mut(&id) {
-                            Some(ChannelTx {
-                                id,
-                                mux_writer,
-                                mux_writer_processed,
-                                read_flag,
-                                ..
-                            }) if *read_flag => match mux_writer.write_all(&payload).await {
-                                Ok(_) => {
-                                    *mux_writer_processed += payload.len();
-                                    if *mux_writer_processed > NOTIFY_AFTER_PROCESSED_SIZE {
-                                        w_frame_tx
-                                            .send(Frame::ContentProcessed {
-                                                id: *id,
-                                                processed: *mux_writer_processed as u32,
-                                            })
-                                            .await?;
-                                        *mux_writer_processed = 0;
+                        Frame::Content { id, payload } => {
+                            let channel = map.get_mut(&id).unwrap();
+                            if channel.read_flag {
+                                match channel.mux_input.write_all(&payload).await {
+                                    Ok(_) => {
+                                        channel.mux_input_processed += payload.len();
+                                        if channel.mux_input_processed > NOTIFY_AFTER_PROCESSED_SIZE {
+                                            output_tx
+                                                .send(Frame::ContentProcessed {
+                                                    id: id,
+                                                    processed: channel.mux_input_processed as u32,
+                                                })
+                                                .await?;
+                                                channel.mux_input_processed = 0;
+                                        }
                                     }
-                                }
-                                Err(_) => {
-                                    w_frame_tx.send(Frame::ReadComplited { id: *id }).await?;
-                                    *read_flag = false;
-                                }
-                            },
-                            _ => {}
-                        },
-                        Frame::ContentProcessed { id, processed } => match map.get_mut(&id) {
-                            Some(c) => {
-                                c.rem_w_size
-                                    .fetch_add(processed as usize, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            None => info!("id: {} not found", id),
-                        },
-                        Frame::WriteComplited { id } => match map.get_mut(&id) {
-                            Some(channel) => {
-                                channel.rem_write_flag = false;
-                                if channel.read_flag {
-                                    channel.input_arbiter.close();
-                                    w_frame_tx.send(Frame::ReadComplited { id }).await?;
-                                    channel.read_flag = false;
-                                }
-                                if !channel.rem_write_flag && !channel.rem_read_flag {
-                                    map.remove(&id).unwrap();
-                                    if let ChannelId::Local(id) = id {
-                                        ids_pool.return_id(id).unwrap();
+                                    Err(_) => {
+                                        output_tx.send(Frame::ReadComplited { id }).await?;
+                                        channel.read_flag = false;
                                     }
                                 }
                             }
-                            None => info!("id: {} not found", id),
                         },
-                        Frame::ReadComplited { id } => match map.get_mut(&id) {
-                            Some(channel) => {
-                                channel.rem_read_flag = false;
-                                channel.output_arbiter.close();
-                                if !channel.rem_write_flag && !channel.rem_read_flag {
-                                    map.remove(&id).unwrap();
-                                    if let ChannelId::Local(id) = id {
-                                        ids_pool.return_id(id).unwrap();
-                                    }
+                        Frame::ContentProcessed { id, processed } => {
+                            let channel = map.get_mut(&id).unwrap();
+                            channel.mux_output_w_size
+                                .fetch_add(processed as usize, std::sync::atomic::Ordering::Relaxed);
+                        },
+                        Frame::WriteComplited { id } => {
+                            let channel = map.get_mut(&id).unwrap();
+                            channel.rem_write_flag = false;
+                            if channel.read_flag {
+                                channel.input_arbiter.close();
+                                output_tx.send(Frame::ReadComplited { id }).await?;
+                                channel.read_flag = false;
+                            }
+                            if !channel.rem_write_flag && !channel.rem_read_flag {
+                                map.remove(&id).unwrap();
+                                if let ChannelId::Local(id) = id {
+                                    ids_pool.return_id(id).unwrap();
                                 }
                             }
-                            None => info!("id: {} not found", id),
+                        },
+                        Frame::ReadComplited { id } => {
+                            let channel = map.get_mut(&id).unwrap();
+                            channel.rem_read_flag = false;
+                            channel.output_arbiter.close();
+                            if !channel.rem_write_flag && !channel.rem_read_flag {
+                                map.remove(&id).unwrap();
+                                if let ChannelId::Local(id) = id {
+                                    ids_pool.return_id(id).unwrap();
+                                }
+                            }
                         },
                     },
                     None => break,
@@ -413,37 +407,37 @@ where
 
 fn spawn_mux_read(
     id: ChannelId,
-    reader_w_size: Arc<AtomicUsize>,
-    mut mux_reader: PipeReader,
-    writer: Sender<Frame>,
+    mut mux_output: PipeReader,
+    input: Sender<Frame>,
+    mux_output_w_size: Arc<AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = async move {
             let mut buf = [0_u8; 2 * 1024];
             loop {
-                let size = reader_w_size.load(std::sync::atomic::Ordering::Relaxed);
+                let size = mux_output_w_size.load(std::sync::atomic::Ordering::Relaxed);
                 let size = cmp::min(size as usize, buf.len());
                 if size <= 0 {
-                    if mux_reader.is_closed() {
+                    if mux_output.is_closed() {
                         break;
                     }
                     tokio::task::yield_now().await;
                     continue;
                 }
-                match mux_reader.read(&mut buf[0..size]).await {
+                match mux_output.read(&mut buf[0..size]).await {
                     Ok(n) if n > 0 => {
-                        writer
+                        input
                             .send(Frame::Content {
                                 id,
                                 payload: buf[0..n].to_vec(),
                             })
                             .await?;
-                        reader_w_size.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+                        mux_output_w_size.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
                     }
                     _ => break,
                 }
             }
-            writer.send(Frame::WriteComplited { id }).await?;
+            input.send(Frame::WriteComplited { id }).await?;
             Result::<(), Box<dyn Error>>::Ok(())
         }
         .await
@@ -457,25 +451,21 @@ const MAX_PAYLOAD_SIZE: usize = 20 * 1024;
 const REM_WIN_SIZE: usize = 5 * MAX_PAYLOAD_SIZE;
 const NOTIFY_AFTER_PROCESSED_SIZE: usize = REM_WIN_SIZE / 2;
 
-struct ChannelTx {
+struct ChannelInner {
     id: ChannelId,
     input_arbiter: PipeArbiter,
     output_arbiter: PipeArbiter,
-    mux_writer: PipeWriter,
-    mux_writer_processed: usize,
-    rem_w_size: Arc<AtomicUsize>,
+    mux_input: PipeWriter,
+    mux_input_processed: usize,
+    mux_output_w_size: Arc<AtomicUsize>,
     read_flag: bool,
     rem_read_flag: bool,
     rem_write_flag: bool,
 }
 
 #[derive(Debug)]
-struct ChannelRx {
+struct Channel {
     id: ChannelId,
     wo: PipeWriter,
     ri: PipeReader,
-}
-
-fn io_err(detail: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, detail)
 }
