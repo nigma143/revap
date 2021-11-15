@@ -120,7 +120,7 @@ impl TlsOutbound {
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let (source, ir, iw) = match incoming {
+        let (source, ri, wi) = match incoming {
             Incoming::Stream {
                 source,
                 reader,
@@ -129,9 +129,9 @@ impl TlsOutbound {
         };
 
         match self.connect().await {
-            Ok((or, ow)) => {
+            Ok((ro, wo)) => {
                 debug!("forwarding {} --> TLS({})", source, self.addr);
-                match io_process(ir, iw, or, ow).await {
+                match io_process(ri, wi, ro, wo).await {
                     Ok(_) => {}
                     Err(e) => error!(
                         "error at process {} --> TLS({}). detail: {}",

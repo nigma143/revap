@@ -5,7 +5,7 @@ use tokio::io;
 
 use crate::{
     outbound::Outbound,
-    revtcp_bound::{inbound_revtcp, RevTcpOutbound},
+    revtcp_bound::{RevTcpInbound, RevTcpOutbound},
     tcp_bound::{inbound_tcp, inbound_tls, TcpOutbound, TlsOutbound},
 };
 
@@ -27,12 +27,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "127.0.0.1:8080".to_string().parse().unwrap(),
         ))];
 
-        inbound_revtcp(addr1, outbounds).await?;
+        let mut inbound = RevTcpInbound::bind_tls(addr1, "hello".into());
+        inbound.forwarding(outbounds).await?;
         //inbound_tcp(addr1, outbounds).await?;
     } else {
         let addr1 = SocketAddr::from(([127, 0, 0, 1], 5001));
 
-        let rev = RevTcpOutbound::bind(SocketAddr::from(([127, 0, 0, 1], 4001)));
+        let cert_chain = load_certs(Path::new("testdata/cert.pem"))?;
+        let key_der = load_keys(Path::new("testdata/key.pem"))?.remove(0);
+
+        let rev = RevTcpOutbound::bind_tls(
+            SocketAddr::from(([127, 0, 0, 1], 4001)),
+            vec!["hello".into()],
+            cert_chain,
+            key_der
+        )
+        .await
+        .unwrap();
         let outbounds = vec![Outbound::RevTcp(rev)];
 
         //let rev = TcpOutbound::new(SocketAddr::from(([127, 0, 0, 1], 4001)));
@@ -43,4 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn load_certs(path: &Path) -> io::Result<Vec<rustls::Certificate>> {
+    rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(path)?))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))
+        .map(|mut certs| certs.drain(..).map(rustls::Certificate).collect())
+}
+
+fn load_keys(path: &Path) -> io::Result<Vec<rustls::PrivateKey>> {
+    rustls_pemfile::rsa_private_keys(&mut std::io::BufReader::new(std::fs::File::open(path)?))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))
+        .map(|mut keys| keys.drain(..).map(rustls::PrivateKey).collect())
 }

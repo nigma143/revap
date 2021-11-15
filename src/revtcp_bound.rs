@@ -1,21 +1,21 @@
 use std::{
+    error::Error,
     io,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use std::ops::DerefMut;
-
-use log::{debug, error, info};
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{
         mpsc::{channel, Sender},
         oneshot,
     },
+    time,
 };
+use tokio_rustls::TlsAcceptor;
 
 use crate::{
     mux::{ChannelId, MuxConnection, MuxConnector},
@@ -23,63 +23,184 @@ use crate::{
     pipe::{PipeReader, PipeWriter},
 };
 
-struct RevTcpListener {
+struct VerifierDummy;
+
+impl rustls::client::ServerCertVerifier for VerifierDummy {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::Certificate,
+        intermediates: &[rustls::Certificate],
+        server_name: &rustls::ServerName,
+        scts: &mut dyn Iterator<Item = &[u8]>,
+        ocsp_response: &[u8],
+        now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+pub struct RevTcpInbound {
     addr: SocketAddr,
+    access_key: String,
+    tls_connector: Option<tokio_rustls::TlsConnector>,
     mux: Option<MuxConnection>,
 }
 
-impl RevTcpListener {
-    pub fn bind(addr: SocketAddr) -> Self {
-        Self { addr, mux: None }
+impl RevTcpInbound {
+    pub fn bind_tcp(addr: SocketAddr, access_key: String) -> Self {
+        RevTcpInbound::bind(addr, access_key, None)
     }
 
-    pub async fn accept(&mut self) -> io::Result<(ChannelId, PipeReader, PipeWriter)> {
-        loop {
-            if self.mux.is_none() {
-                let stream = match TcpStream::connect(self.addr).await {
-                    Ok(o) => {
-                        info!("connected to {}", self.addr);
-                        o
-                    }
-                    Err(e) => {
-                        error!("error at connect to {}. detail: {}", self.addr, e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
-                self.mux = Some(MuxConnection::new(stream));
-            }
+    pub fn bind_tls(addr: SocketAddr, access_key: String) -> Self {
+        let mut config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(Arc::new(VerifierDummy {}))
+            .with_no_client_auth();
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        RevTcpInbound::bind(addr, access_key, Some(tls_connector))
+    }
 
-            let mux = self.mux.as_mut().unwrap();
-
-            let res = match mux.accept().await {
-                Ok(o) => {
-                    debug!("incoming mux channel from {}", self.addr);
-                    o
-                }
-                Err(e) => {
-                    error!(
-                        "error at listen mux channel from {}. detail: {}",
-                        self.addr, e
-                    );
-                    self.mux = None;
-                    continue;
-                }
-            };
-
-            return Ok(res);
+    fn bind(
+        addr: SocketAddr,
+        access_key: String,
+        tls_connector: Option<tokio_rustls::TlsConnector>,
+    ) -> Self {
+        Self {
+            addr,
+            access_key,
+            tls_connector,
+            mux: None,
         }
+    }
+
+    pub async fn forwarding(&mut self, mut outbounds: Vec<Outbound>) -> io::Result<()> {
+        let mut index = 0;
+        while let Ok((_, reader, writer)) = self.accept().await {
+            if index >= outbounds.len() {
+                index = 0;
+            }
+            let mut outbound = outbounds.get_mut(index).unwrap().clone();
+            index += 1;
+
+            tokio::spawn(async move {
+                outbound
+                    .forwarding(Incoming::Stream {
+                        source: "".into(),
+                        reader,
+                        writer,
+                    })
+                    .await
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn accept(&mut self) -> Result<(ChannelId, PipeReader, PipeWriter), Box<dyn Error>> {
+        loop {
+            match self.mux.as_mut() {
+                Some(mux) => {
+                    match mux.accept().await {
+                        Ok(channel) => {
+                            return Ok(channel);
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "error at listen mux channel from {}. detail: {}",
+                                self.addr,
+                                e
+                            );
+                            self.mux = None;
+                        }
+                    };
+                }
+                None => {
+                    let res = match TcpStream::connect(self.addr).await {
+                        Ok(stream) => match self.tls_connector.as_mut() {
+                            Some(tls_connector) => {
+                                match tls_connector
+                                    .connect("domain".try_into().unwrap(), stream)
+                                    .await
+                                {
+                                    Ok(stream) => {
+                                        RevTcpInbound::create_mux(stream, &self.access_key).await
+                                    }
+                                    Err(e) => Err(format!("error at accept tls. {}", e).into()),
+                                }
+                            }
+                            None => RevTcpInbound::create_mux(stream, &self.access_key).await,
+                        },
+                        Err(e) => {
+                            log::error!("error at connect to {}. detail: {}", self.addr, e);
+                            time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
+
+                    match res {
+                        Ok(mux) => self.mux = Some(mux),
+                        Err(e) => {
+                            log::error!("error at connect to {}. detail: {}", self.addr, e);
+                            time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn create_mux<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        mut stream: T,
+        access_key: &str,
+    ) -> Result<MuxConnection, Box<dyn Error>> {
+        RevTcpInbound::acl(&mut stream, access_key).await?;
+        Ok(MuxConnection::new(stream))
+    }
+
+    async fn acl<T: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: T,
+        access_key: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let buf = access_key.as_bytes();
+        stream.write_u8(buf.len() as u8).await?;
+        stream.write_all(buf).await?;
+        Ok(())
     }
 }
 
 #[derive(Clone)]
 pub struct RevTcpOutbound {
     addr: SocketAddr,
-    conn_tx: Sender<oneshot::Sender<io::Result<(SocketAddr, MuxConnector)>>>,
+    conn_tx: Sender<oneshot::Sender<Option<(SocketAddr, MuxConnector)>>>,
 }
 
 impl RevTcpOutbound {
-    pub fn bind(addr: SocketAddr) -> Self {
+    pub async fn bind_tcp(
+        addr: SocketAddr,
+        access_keys: Vec<String>,
+    ) -> Result<Self, Box<dyn Error>> {
+        RevTcpOutbound::bind(addr, access_keys, None).await
+    }
+
+    pub async fn bind_tls(
+        addr: SocketAddr,
+        access_keys: Vec<String>,
+        cert_chain: Vec<rustls::Certificate>,
+        key_der: rustls::PrivateKey,
+    ) -> Result<Self, Box<dyn Error>> {
+        let config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key_der)?;
+        RevTcpOutbound::bind(addr, access_keys, Some(TlsAcceptor::from(Arc::new(config)))).await
+    }
+
+    async fn bind(
+        addr: SocketAddr,
+        access_keys: Vec<String>,
+        tls_acceptor: Option<TlsAcceptor>,
+    ) -> Result<Self, Box<dyn Error>> {
         let pool: Arc<Mutex<Vec<(SocketAddr, MuxConnection)>>> = Arc::new(Mutex::new(Vec::new()));
         let pool_ref = pool.clone();
         let (conn_tx, mut conn_rx) = channel(1024);
@@ -87,41 +208,101 @@ impl RevTcpOutbound {
         tokio::spawn(async move {
             let mut index = 0;
             loop {
-                let rq: oneshot::Sender<io::Result<(SocketAddr, MuxConnector)>> =
-                    conn_rx.recv().await.unwrap();
-                let mut pool = pool.lock().unwrap();
+                match conn_rx.recv().await {
+                    Some(rq) => {
+                        let rq: oneshot::Sender<Option<(SocketAddr, MuxConnector)>> = rq;
 
-                pool.retain(|x| !x.1.is_closed());
+                        let mut pool = pool_ref.lock().unwrap();
+                        pool.retain(|(_, mux)| !mux.is_closed());
 
-                if pool.is_empty() {
-                    rq.send(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "no incoming connection",
-                    )));
-                    continue;
+                        if pool.is_empty() {
+                            let _ = rq.send(None);
+                            continue;
+                        }
+
+                        if pool.len() - 1 < index {
+                            index = 0;
+                        }
+
+                        let (addr, mux) = pool.get_mut(index).unwrap();
+                        let _ = rq.send(Some((addr.clone(), mux.create_connector())));
+
+                        index += 1;
+                    }
+                    None => break,
                 }
-
-                if pool.len() - 1 < index {
-                    index = 0;
-                }
-
-                let item = pool.get_mut(index).unwrap();
-                rq.send(Ok((item.0, item.1.create_connector())));
-
-                index += 1;
             }
         });
+
+        let listener = TcpListener::bind(addr).await?;
+        let access_keys = Arc::new(Mutex::new(access_keys));
 
         tokio::spawn(async move {
-            let listener = TcpListener::bind(addr).await.unwrap();
             while let Ok((stream, rem_addr)) = listener.accept().await {
-                info!("incoming connection for {} from {}", addr, rem_addr);
-                let mux = MuxConnection::new(stream);
-                pool_ref.lock().unwrap().push((rem_addr, mux));
+                let tls_acceptor = tls_acceptor.clone();
+                let access_keys = access_keys.clone();
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let res = match tls_acceptor {
+                        Some(tls_acceptor) => match tls_acceptor.accept(stream).await {
+                            Ok(stream) => RevTcpOutbound::create_mux(stream, access_keys).await,
+                            Err(e) => Err(format!("error at accept tls. {}", e).into()),
+                        },
+                        None => RevTcpOutbound::create_mux(stream, access_keys).await,
+                    };
+                    match res {
+                        Ok(mux) => pool.lock().unwrap().push((rem_addr, mux)),
+                        Err(e) => {
+                            log::error!(
+                                "error at accept {} from {}. detail: {}",
+                                addr,
+                                rem_addr,
+                                e
+                            );
+                        }
+                    }
+                });
             }
         });
 
-        Self { addr, conn_tx }
+        Ok(Self { addr, conn_tx })
+    }
+
+    async fn create_mux<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        mut stream: T,
+        access_keys: Arc<Mutex<Vec<String>>>,
+    ) -> Result<MuxConnection, Box<dyn Error>> {
+        RevTcpOutbound::acl(&mut stream, access_keys).await?;
+        Ok(MuxConnection::new(stream))
+    }
+
+    async fn acl<T: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: T,
+        access_keys: Arc<Mutex<Vec<String>>>,
+    ) -> Result<(), Box<dyn Error>> {
+        let fut = async {
+            let len = stream.read_u8().await? as usize;
+            let mut buf = Vec::with_capacity(len);
+            unsafe {
+                buf.set_len(len);
+            }
+            stream.read_exact(&mut buf).await?;
+            let access_key = String::from_utf8(buf)?;
+            let result = access_keys.lock().unwrap().contains(&access_key);
+            if result {
+                Result::<(), Box<dyn Error>>::Ok(())
+            } else {
+                Err("invalid access key".into())
+            }
+        };
+
+        if let Result::<Result<(), Box<dyn Error>>, time::error::Elapsed>::Ok(res) =
+            time::timeout(Duration::from_secs(1), fut).await
+        {
+            res
+        } else {
+            Err("timeout at check access key".into())
+        }
     }
 
     async fn connect(&mut self) -> io::Result<(SocketAddr, (ChannelId, PipeReader, PipeWriter))> {
@@ -130,7 +311,10 @@ impl RevTcpOutbound {
             .send(tx)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "connection channel is die"))?;
-        let (rem_addr, mut mux) = rx.await.unwrap()?;
+        let (rem_addr, mut mux) = rx.await.unwrap().ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "no incoming connection",
+        ))?;
         let channel = mux.connect().await?;
         Ok((rem_addr, channel))
     }
@@ -140,57 +324,32 @@ impl RevTcpOutbound {
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let (source, ir, iw) = match incoming {
+        let (source, ri, wi) = match incoming {
             Incoming::Stream {
                 source,
                 reader,
                 writer,
             } => (source, reader, writer),
         };
-
         match self.connect().await {
-            Ok((addr, (id, or, ow))) => {
-                debug!("forwarding {} --> REVTCP({}/{})", source, addr, id);
-                match io_process(ir, iw, or, ow).await {
+            Ok((addr, (id, ro, wo))) => {
+                match io_process(ri, wi, ro, wo).await {
                     Ok(_) => {}
-                    Err(e) => error!(
-                        "error at process {} --> REVTCP({}/{}). detail: {}",
-                        source, addr, id, e
+                    Err(e) => log::error!(
+                        "error at process {} --> {}/{}. detail: {}",
+                        source,
+                        addr,
+                        id,
+                        e
                     ),
                 };
             }
-            Err(e) => error!(
-                "error at connect over REVTCP(listen: {}) for {}. detail: {}",
-                self.addr, source, e
+            Err(e) => log::error!(
+                "error at connect over {} for {}. detail: {}",
+                self.addr,
+                source,
+                e
             ),
         }
     }
-}
-
-pub async fn inbound_revtcp(addr: SocketAddr, mut outbounds: Vec<Outbound>) -> io::Result<()> {
-    let mut listener = RevTcpListener::bind(addr);
-    info!("REVTCP listen at {}", addr);
-
-    let mut index = 0;
-    while let Ok((id, reader, writer)) = listener.accept().await {
-        debug!("REVTCP({}) incoming from {}", addr, id);
-
-        if index >= outbounds.len() {
-            index = 0;
-        }
-        let mut outbound = outbounds.get_mut(index).unwrap().clone();
-        index += 1;
-
-        tokio::spawn(async move {
-            outbound
-                .forwarding(Incoming::Stream {
-                    source: format!("REVTCP({}/{})", addr, id),
-                    reader,
-                    writer,
-                })
-                .await
-        });
-    }
-
-    Ok(())
 }
