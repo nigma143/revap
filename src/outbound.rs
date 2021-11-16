@@ -3,10 +3,7 @@ use std::io;
 use log::*;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{
-    revtcp_bound::RevTcpOutbound,
-    tcp_bound::{TcpOutbound, TlsOutbound},
-};
+use crate::{revtcp_bound::RevTcpOutbound, tcp_bound::TcpOutbound};
 
 pub enum Incoming<R, W> {
     Stream {
@@ -18,22 +15,27 @@ pub enum Incoming<R, W> {
 
 #[derive(Clone)]
 pub enum Outbound {
-    Tcp(TcpOutbound),
-    Tls(TlsOutbound),
-    RevTcp(RevTcpOutbound),
+    Tcp(String, TcpOutbound),
+    RevTcp(String, RevTcpOutbound),
 }
 
 impl Outbound {
-    pub async fn forwarding<R, W>(&mut self, incoming: Incoming<R, W>)
+    pub fn alias(&self) -> &str {
+        match self {
+            Outbound::Tcp(a, _) => a,
+            Outbound::RevTcp(a, _) => a,
+        }
+    }
+
+    pub async fn forwarding<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
         match self {
-            Outbound::Tcp(o) => o.forwarding(incoming).await,
-            Outbound::Tls(o) => o.forwarding(incoming).await,
-            Outbound::RevTcp(o) => o.forwarding(incoming).await,
-        };
+            Outbound::Tcp(_, o) => o.forwarding(incoming).await,
+            Outbound::RevTcp(_, o) => o.forwarding(incoming).await,
+        }
     }
 }
 

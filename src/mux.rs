@@ -316,16 +316,15 @@ where
                         let w_size = WIN_SIZE;
                         let rem_w_size = Arc::new(AtomicUsize::new(w_size));
                         let (channel_tx, ro, channel_rx) = crate_channel(id, w_size, rem_w_size.clone());
-                        if let Ok(_) = shot.send(channel_rx) {
-                            spawn_channel_read(id, ro, output_tx.clone(), rem_w_size.clone()); //
-                            map.insert(id, channel_tx);
-                            output_tx
-                                .send(Frame::New {
-                                    id,
-                                    rem_w_size: w_size as u32,
-                                })
-                                .await?;
-                        }
+                        map.insert(id, channel_tx);
+                        output_tx
+                            .send(Frame::New {
+                                id,
+                                rem_w_size: w_size as u32,
+                            })
+                            .await?;
+                        spawn_channel_read(id, ro, output_tx.clone(), rem_w_size.clone()); //
+                        let _ = shot.send(channel_rx);
                     }
                     None => break,
                 }
@@ -336,9 +335,9 @@ where
                         Frame::New { id, rem_w_size } => {
                             let rem_w_size = Arc::new(AtomicUsize::new(rem_w_size as usize));
                             let (channel_tx, ro, channel_rx) = crate_channel(id, WIN_SIZE, rem_w_size.clone());
+                            map.insert(id, channel_tx);
                             spawn_channel_read(id, ro, output_tx.clone(), rem_w_size.clone());
                             listen.send(channel_rx).await?;
-                            map.insert(id, channel_tx);
                         }
                         Frame::Content { id, payload } => {
                             let channel = map.get_mut(&id).unwrap();

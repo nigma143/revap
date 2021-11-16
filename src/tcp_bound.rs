@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     fmt::{self, format},
     io::{self, BufReader},
     net::SocketAddr,
@@ -19,58 +20,15 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::{
     main,
-    outbound::{io_process, Incoming, Outbound},
+    outbound::{self, io_process, Incoming, Outbound},
     revtcp_bound::RevTcpOutbound,
 };
 
 #[derive(Clone)]
 pub struct TcpOutbound {
-    pub addr: SocketAddr,
-}
-
-impl TcpOutbound {
-    pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
-    }
-
-    pub async fn connect(&mut self) -> io::Result<(ReadHalf<TcpStream>, WriteHalf<TcpStream>)> {
-        let stream = TcpStream::connect(self.addr).await?;
-        Ok(split(stream))
-    }
-
-    pub async fn forwarding<R, W>(&mut self, incoming: Incoming<R, W>)
-    where
-        W: AsyncWrite + Unpin,
-        R: AsyncRead + Unpin,
-    {
-        let (source, ir, iw) = match incoming {
-            Incoming::Stream {
-                source,
-                reader,
-                writer,
-            } => (source, reader, writer),
-        };
-
-        match self.connect().await {
-            Ok((or, ow)) => {
-                debug!("forwarding {} --> TLS({})", source, self.addr);
-                match io_process(ir, iw, or, ow).await {
-                    Ok(_) => {}
-                    Err(e) => error!(
-                        "error at process {} --> TLS({}). detail: {}",
-                        source, self.addr, e
-                    ),
-                }
-            }
-            Err(_) => todo!(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct TlsOutbound {
-    pub addr: SocketAddr,
-    config: Arc<ClientConfig>,
+    alias: String,
+    addr: SocketAddr,
+    tls_connector: Option<tokio_rustls::TlsConnector>,
 }
 
 struct VerifierDummy;
@@ -89,33 +47,33 @@ impl rustls::client::ServerCertVerifier for VerifierDummy {
     }
 }
 
-impl TlsOutbound {
-    pub fn new(addr: SocketAddr) -> Self {
-        let mut config = ClientConfig::builder()
+impl TcpOutbound {
+    pub fn new_tcp(alias: impl Into<String>, addr: SocketAddr) -> Self {
+        TcpOutbound::new(alias.into(), addr, None)
+    }
+
+    pub fn new_tls(alias: impl Into<String>, addr: SocketAddr) -> Self {
+        let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(VerifierDummy {}))
             .with_no_client_auth();
-        //config.enable_sni = false;
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        TcpOutbound::new(alias.into(), addr, Some(tls_connector))
+    }
 
+    fn new(
+        alias: String,
+        addr: SocketAddr,
+        tls_connector: Option<tokio_rustls::TlsConnector>,
+    ) -> Self {
         Self {
+            alias,
             addr,
-            config: Arc::new(config),
+            tls_connector,
         }
     }
 
-    async fn connect(
-        &mut self,
-    ) -> io::Result<(
-        ReadHalf<TlsStream<TcpStream>>,
-        WriteHalf<TlsStream<TcpStream>>,
-    )> {
-        let socket = TcpStream::connect(self.addr).await?;
-        let cx = tokio_rustls::TlsConnector::from(self.config.clone());
-        let stream = cx.connect("dummy".try_into().unwrap(), socket).await?;
-        Ok(split(stream))
-    }
-
-    pub async fn forwarding<R, W>(&mut self, incoming: Incoming<R, W>)
+    pub async fn forwarding<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
@@ -128,115 +86,133 @@ impl TlsOutbound {
             } => (source, reader, writer),
         };
 
-        match self.connect().await {
-            Ok((ro, wo)) => {
-                debug!("forwarding {} --> TLS({})", source, self.addr);
-                match io_process(ri, wi, ro, wo).await {
-                    Ok(_) => {}
-                    Err(e) => error!(
-                        "error at process {} --> TLS({}). detail: {}",
-                        source, self.addr, e
-                    ),
+        match TcpStream::connect(self.addr).await {
+            Ok(stream) => match self.tls_connector.as_mut() {
+                Some(tls_connector) => {
+                    match tls_connector
+                        .connect("domain".try_into().unwrap(), stream)
+                        .await
+                    {
+                        Ok(stream) => {
+                            let (ro, wo) = split(stream);
+                            match io_process(ri, wi, ro, wo).await {
+                                Ok(_) => {}
+                                Err(e) => error!(
+                                    "error at process {} --> TLS({}). detail: {}",
+                                    source, self.addr, e
+                                ),
+                            }
+                        }
+                        Err(e) => todo!(),
+                    }
                 }
-            }
+                None => {
+                    let (ro, wo) = split(stream);
+                    match io_process(ri, wi, ro, wo).await {
+                        Ok(_) => {}
+                        Err(e) => error!(
+                            "error at process {} --> TLS({}). detail: {}",
+                            source, self.addr, e
+                        ),
+                    }
+                }
+            },
             Err(_) => todo!(),
         }
+        Ok(())
     }
 }
 
-pub async fn inbound_tcp(addr: SocketAddr, mut outbounds: Vec<Outbound>) -> io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("TCP listen at {}", addr);
-
-    let mut index = 0;
-    while let Ok((stream, rem_addr)) = listener.accept().await {
-        debug!("TCP({}) incoming from {}", addr, rem_addr);
-
-        if index >= outbounds.len() {
-            index = 0;
-        }
-        let mut outbound = outbounds.get_mut(index).unwrap().clone();
-        index += 1;
-
-        tokio::spawn(async move {
-            let (reader, writer) = split(stream);
-            outbound
-                .forwarding(Incoming::Stream {
-                    source: format!("TCP({}/{})", addr, rem_addr),
-                    reader,
-                    writer,
-                })
-                .await
-        });
-    }
-
-    Ok(())
+pub struct TcpInbound {
+    alias: String,
+    listener: TcpListener,
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
-pub async fn inbound_tls(
-    addr: SocketAddr,
-    certs: &Path,
-    keys: &Path,
-    mut outbounds: Vec<Outbound>,
-) -> io::Result<()> {
-    let certs = load_certs(certs)?;
-    let mut keys = load_keys(keys)?;
+impl TcpInbound {
+    pub async fn bind_tcp(
+        alias: impl Into<String>,
+        addr: SocketAddr,
+    ) -> Result<Self, Box<dyn Error>> {
+        TcpInbound::bind(alias.into(), addr, None).await
+    }
 
-    let config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, keys.remove(0))
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let tls_acceptor = TlsAcceptor::from(Arc::new(config));
+    pub async fn bind_tls(
+        alias: impl Into<String>,
+        addr: SocketAddr,
+        cert_chain: Vec<rustls::Certificate>,
+        key_der: rustls::PrivateKey,
+    ) -> Result<Self, Box<dyn Error>> {
+        let config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key_der)?;
+        TcpInbound::bind(
+            alias.into(),
+            addr,
+            Some(TlsAcceptor::from(Arc::new(config))),
+        )
+        .await
+    }
 
-    let listener = TcpListener::bind(addr).await?;
-    info!("TLS listen at {}", addr);
+    async fn bind(
+        alias: String,
+        addr: SocketAddr,
+        tls_acceptor: Option<TlsAcceptor>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let listener = TcpListener::bind(addr).await?;
+        Ok(Self {
+            alias,
+            listener,
+            tls_acceptor,
+        })
+    }
 
-    let mut index = 0;
-    while let Ok((stream, rem_addr)) = listener.accept().await {
-        debug!("TLS({}) incoming from {}", addr, rem_addr);
+    pub async fn forwarding(&mut self, mut outbounds: Vec<Outbound>) -> io::Result<()> {
+        let mut index = 0;
+        while let Ok((stream, rem_addr)) = self.listener.accept().await {
+            let alias = self.alias.clone();
+            let tls_acceptor = self.tls_acceptor.clone();
 
-        if index >= outbounds.len() {
-            index = 0;
-        }
-        let mut outbound = outbounds.get_mut(index).unwrap().clone();
-        index += 1;
+            if index >= outbounds.len() {
+                index = 0;
+            }
+            let mut outbound = outbounds.get_mut(index).unwrap().clone();
+            index += 1;
 
-        let tls_acceptor = tls_acceptor.clone();
+            tokio::spawn(async move {
+                let res = match tls_acceptor {
+                    Some(tls_acceptor) => match tls_acceptor.accept(stream).await {
+                        Ok(stream) => forwarding(stream, &mut outbound).await,
+                        Err(e) => Err(e),
+                    },
+                    None => forwarding(stream, &mut outbound).await,
+                };
 
-        tokio::spawn(async move {
-            match tls_acceptor.accept(stream).await {
-                Ok(stream) => {
-                    let (reader, writer) = split(stream);
-                    outbound
-                        .forwarding(Incoming::Stream {
-                            source: format!("TLS({}/{})", addr, rem_addr),
-                            reader,
-                            writer,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    error!(
-                        "error at accept TLS({}) from {}. detail: {}",
-                        addr, rem_addr, e
+                if let Err(e) = res {
+                    log::error!(
+                        "error on process ({}) -> ({}). details: {}",
+                        alias,
+                        outbound.alias(),
+                        e
                     );
                 }
-            }
-        });
+            });
+        }
+        Ok(())
     }
-
-    Ok(())
 }
 
-fn load_certs(path: &Path) -> io::Result<Vec<Certificate>> {
-    certs(&mut BufReader::new(std::fs::File::open(path)?))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))
-        .map(|mut certs| certs.drain(..).map(Certificate).collect())
-}
-
-fn load_keys(path: &Path) -> io::Result<Vec<PrivateKey>> {
-    rsa_private_keys(&mut BufReader::new(std::fs::File::open(path)?))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))
-        .map(|mut keys| keys.drain(..).map(PrivateKey).collect())
+async fn forwarding<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    outbound: &mut Outbound,
+) -> io::Result<()> {
+    let (reader, writer) = split(stream);
+    outbound
+        .forwarding(Incoming::Stream {
+            source: "sdfds".into(),
+            reader,
+            writer,
+        })
+        .await
 }

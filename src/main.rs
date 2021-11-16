@@ -6,7 +6,7 @@ use tokio::io;
 use crate::{
     outbound::Outbound,
     revtcp_bound::{RevTcpInbound, RevTcpOutbound},
-    tcp_bound::{inbound_tcp, inbound_tls, TcpOutbound, TlsOutbound},
+    tcp_bound::{TcpInbound, TcpOutbound},
 };
 
 pub mod mux;
@@ -23,15 +23,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{:?}", args);
     if args.len() > 1 {
         let addr1 = SocketAddr::from(([127, 0, 0, 1], 4001));
-        let outbounds = vec![Outbound::Tls(TlsOutbound::new(
-            "127.0.0.1:8080".to_string().parse().unwrap(),
-        ))];
+        let outbounds = vec![Outbound::Tcp(
+            "tls_test".into(),
+            TcpOutbound::new_tls("sdfds", "127.0.0.1:8080".to_string().parse().unwrap()),
+        )];
 
-        let mut inbound = RevTcpInbound::bind_tls(addr1, "hello".into());
+        let mut inbound = RevTcpInbound::bind_tls("rev_tls_test", addr1, "hello".into());
         inbound.forwarding(outbounds).await?;
         //inbound_tcp(addr1, outbounds).await?;
     } else {
-        let addr1 = SocketAddr::from(([127, 0, 0, 1], 5001));
+        let addr1 = SocketAddr::from(([0, 0, 0, 0], 5001));
 
         let cert_chain = load_certs(Path::new("testdata/cert.pem"))?;
         let key_der = load_keys(Path::new("testdata/key.pem"))?.remove(0);
@@ -40,17 +41,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SocketAddr::from(([127, 0, 0, 1], 4001)),
             vec!["hello".into()],
             cert_chain,
-            key_der
+            key_der,
         )
         .await
         .unwrap();
-        let outbounds = vec![Outbound::RevTcp(rev)];
+        let outbounds = vec![Outbound::RevTcp("rev_tls_test".into(), rev)];
 
         //let rev = TcpOutbound::new(SocketAddr::from(([127, 0, 0, 1], 4001)));
         //let outbounds = vec![Outbound::Tcp(rev)];
 
         //inbound_tls(addr1, Path::new("testdata/cert.pem"), Path::new("testdata/key.pem"), outbounds).await?;
-        inbound_tcp(addr1, outbounds).await?;
+        let mut inbound = TcpInbound::bind_tcp("tcp in alias", addr1).await.unwrap();
+        inbound.forwarding(outbounds).await?;
     }
 
     Ok(())
