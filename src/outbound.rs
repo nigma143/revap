@@ -1,16 +1,12 @@
 use std::io;
 
-use log::*;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{revtcp_bound::RevTcpOutbound, tcp_bound::TcpOutbound};
 
-pub enum Incoming<R, W> {
-    Stream {
-        source: String,
-        reader: R,
-        writer: W,
-    },
+pub struct Incoming<R, W> {
+    pub reader: R,
+    pub writer: W,
 }
 
 #[derive(Clone)]

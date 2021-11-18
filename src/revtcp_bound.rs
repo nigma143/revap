@@ -88,13 +88,7 @@ impl RevTcpInbound {
             index += 1;
 
             tokio::spawn(async move {
-                let res = outbound
-                    .forwarding(Incoming::Stream {
-                        source: "".into(),
-                        reader,
-                        writer,
-                    })
-                    .await;
+                let res = outbound.forwarding(Incoming { reader, writer }).await;
                 if let Err(e) = res {
                     log::error!(
                         "error on process ({}) -> ({}). details: {}",
@@ -135,13 +129,11 @@ impl RevTcpInbound {
                                     .connect("domain".try_into().unwrap(), stream)
                                     .await
                                 {
-                                    Ok(stream) => {
-                                        RevTcpInbound::create_mux(stream, &self.access_key).await
-                                    }
-                                    Err(e) => Err(format!("error at accept tls. {}", e).into()),
+                                    Ok(stream) => create_client_mux(stream, &self.access_key).await,
+                                    Err(e) => Err(format!("bad tls. {}", e).into()),
                                 }
                             }
-                            None => RevTcpInbound::create_mux(stream, &self.access_key).await,
+                            None => create_client_mux(stream, &self.access_key).await,
                         },
                         Err(e) => {
                             log::error!(
@@ -171,24 +163,6 @@ impl RevTcpInbound {
                 }
             }
         }
-    }
-
-    async fn create_mux<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-        mut stream: T,
-        access_key: &str,
-    ) -> Result<MuxConnection, Box<dyn Error>> {
-        RevTcpInbound::access(&mut stream, access_key).await?;
-        Ok(MuxConnection::new(stream))
-    }
-
-    async fn access<T: AsyncRead + AsyncWrite + Unpin>(
-        mut stream: T,
-        access_key: &str,
-    ) -> Result<(), Box<dyn Error>> {
-        let buf = access_key.as_bytes();
-        stream.write_u8(buf.len() as u8).await?;
-        stream.write_all(buf).await?;
-        Ok(())
     }
 }
 
@@ -233,22 +207,17 @@ impl RevTcpOutbound {
                 match conn_rx.recv().await {
                     Some(rq) => {
                         let rq: oneshot::Sender<Option<MuxConnector>> = rq;
-
                         let mut pool = pool_ref.lock().unwrap();
                         pool.retain(|mux| !mux.is_closed());
-
                         if pool.is_empty() {
                             let _ = rq.send(None);
                             continue;
                         }
-
                         if pool.len() - 1 < index {
                             index = 0;
                         }
-
                         let mux = pool.get_mut(index).unwrap();
                         let _ = rq.send(Some(mux.create_connector()));
-
                         index += 1;
                     }
                     None => break,
@@ -267,16 +236,16 @@ impl RevTcpOutbound {
                 tokio::spawn(async move {
                     let res = match tls_acceptor {
                         Some(tls_acceptor) => match tls_acceptor.accept(stream).await {
-                            Ok(stream) => RevTcpOutbound::create_mux(stream, access_keys).await,
-                            Err(e) => Err(format!("error at accept tls. {}", e).into()),
+                            Ok(stream) => create_server_mux(stream, access_keys).await,
+                            Err(e) => Err(format!("bad tls. {}", e).into()),
                         },
-                        None => RevTcpOutbound::create_mux(stream, access_keys).await,
+                        None => create_server_mux(stream, access_keys).await,
                     };
                     match res {
                         Ok(mux) => pool.lock().unwrap().push(mux),
                         Err(e) => {
                             log::error!(
-                                "error at accept {} from {}. detail: {}",
+                                "error at accept on {} from {}. detail: {}",
                                 addr,
                                 rem_addr,
                                 e
@@ -290,55 +259,15 @@ impl RevTcpOutbound {
         Ok(Self { conn_tx })
     }
 
-    async fn create_mux<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-        mut stream: T,
-        access_keys: Arc<Mutex<Vec<String>>>,
-    ) -> Result<MuxConnection, Box<dyn Error>> {
-        RevTcpOutbound::access(&mut stream, access_keys).await?;
-        Ok(MuxConnection::new(stream))
-    }
-
-    async fn access<T: AsyncRead + AsyncWrite + Unpin>(
-        mut stream: T,
-        access_keys: Arc<Mutex<Vec<String>>>,
-    ) -> Result<(), Box<dyn Error>> {
-        let fut = async {
-            let len = stream.read_u8().await? as usize;
-            let mut buf = Vec::with_capacity(len);
-            unsafe {
-                buf.set_len(len);
-            }
-            stream.read_exact(&mut buf).await?;
-            let access_key = String::from_utf8(buf)?;
-            let result = access_keys.lock().unwrap().contains(&access_key);
-            if result {
-                Result::<(), Box<dyn Error>>::Ok(())
-            } else {
-                Err("invalid access key".into())
-            }
-        };
-
-        if let Result::<Result<(), Box<dyn Error>>, time::error::Elapsed>::Ok(res) =
-            time::timeout(Duration::from_secs(1), fut).await
-        {
-            res
-        } else {
-            Err("timeout at check access key".into())
-        }
-    }
-
     pub async fn forwarding<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let (_alias, ri, wi) = match incoming {
-            Incoming::Stream {
-                source,
-                reader,
-                writer,
-            } => (source, reader, writer),
-        };
+        let Incoming {
+            reader: ri,
+            writer: wi,
+        } = incoming;
 
         let (tx, rx) = oneshot::channel();
         let _ = self.conn_tx.send(tx).await;
@@ -348,5 +277,69 @@ impl RevTcpOutbound {
         ))?;
         let (_id, ro, wo) = mux.connect().await?;
         io_process(ri, wi, ro, wo).await
+    }
+}
+
+const ACCESS_GRANTED: u8 = 0x00;
+const INVALID_ACCESS_KEY: u8 = 0xFF;
+
+async fn create_client_mux<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut stream: T,
+    access_key: &str,
+) -> Result<MuxConnection, Box<dyn Error>> {
+    obtain_access(&mut stream, access_key).await?;
+    Ok(MuxConnection::new(stream))
+}
+
+async fn obtain_access<T: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: T,
+    access_key: &str,
+) -> Result<(), Box<dyn Error>> {
+    let buf = access_key.as_bytes();
+    stream.write_u8(buf.len() as u8).await?;
+    stream.write_all(buf).await?;
+    match stream.read_u8().await? {
+        ACCESS_GRANTED => Ok(()),
+        INVALID_ACCESS_KEY => Err("invalid access key".into()),
+        _ => Err("unexpected access result code".into()),
+    }
+}
+
+async fn create_server_mux<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut stream: T,
+    access_keys: Arc<Mutex<Vec<String>>>,
+) -> Result<MuxConnection, Box<dyn Error>> {
+    check_access(&mut stream, access_keys).await?;
+    Ok(MuxConnection::new(stream))
+}
+
+async fn check_access<T: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: T,
+    access_keys: Arc<Mutex<Vec<String>>>,
+) -> Result<(), Box<dyn Error>> {
+    let fut = async {
+        let len = stream.read_u8().await? as usize;
+        let mut buf = Vec::with_capacity(len);
+        unsafe {
+            buf.set_len(len);
+        }
+        stream.read_exact(&mut buf).await?;
+        let access_key = String::from_utf8(buf)?;
+        let result = access_keys.lock().unwrap().contains(&access_key);
+        if result {
+            stream.write_u8(ACCESS_GRANTED).await?;
+            Result::<(), Box<dyn Error>>::Ok(())
+        } else {
+            stream.write_u8(INVALID_ACCESS_KEY).await?;
+            Err("invalid access key".into())
+        }
+    };
+
+    if let Result::<Result<(), Box<dyn Error>>, time::error::Elapsed>::Ok(res) =
+        time::timeout(Duration::from_secs(1), fut).await
+    {
+        res
+    } else {
+        Err("timeout at check access key".into())
     }
 }

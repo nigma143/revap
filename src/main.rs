@@ -25,10 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr1 = SocketAddr::from(([127, 0, 0, 1], 4001));
         let outbounds = vec![Outbound::Tcp(
             "tls_test".into(),
-            TcpOutbound::new_tls("sdfds", "127.0.0.1:8080".to_string().parse().unwrap()),
+            TcpOutbound::new_tls("127.0.0.1:8080".to_string().parse().unwrap()),
         )];
 
-        let mut inbound = RevTcpInbound::bind_tls("rev_tls_test", addr1, "hello".into());
+        let mut inbound = RevTcpInbound::bind_tls("rev_tls_test", addr1, "hello1".into());
         inbound.forwarding(outbounds).await?;
         //inbound_tcp(addr1, outbounds).await?;
     } else {
