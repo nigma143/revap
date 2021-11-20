@@ -2,7 +2,24 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{revtcp_bound::RevTcpOutbound, tcp_bound::TcpOutbound};
+use crate::{
+    revtcp_bound::{RevTcpInbound, RevTcpOutbound},
+    tcp_bound::{TcpInbound, TcpOutbound},
+};
+
+pub enum Inbound {
+    Tcp(TcpInbound),
+    RevTcp(RevTcpInbound),
+}
+
+impl Inbound {
+    pub async fn forwarding(&mut self, outbounds: Vec<Outbound>) -> io::Result<()> {
+        match self {
+            Inbound::Tcp(o) => o.forwarding(outbounds).await,
+            Inbound::RevTcp(o) => o.forwarding(outbounds).await,
+        }
+    }
+}
 
 pub struct Incoming<R, W> {
     pub reader: R,
@@ -11,26 +28,26 @@ pub struct Incoming<R, W> {
 
 #[derive(Clone)]
 pub enum Outbound {
-    Tcp(String, TcpOutbound),
-    RevTcp(String, RevTcpOutbound),
+    Tcp(TcpOutbound),
+    RevTcp(RevTcpOutbound),
 }
 
 impl Outbound {
     pub fn alias(&self) -> &str {
         match self {
-            Outbound::Tcp(a, _) => a,
-            Outbound::RevTcp(a, _) => a,
+            Outbound::Tcp(o) => o.alias(),
+            Outbound::RevTcp(o) => o.alias(),
         }
     }
 
-    pub async fn forwarding<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
+    pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
         match self {
-            Outbound::Tcp(_, o) => o.forwarding(incoming).await,
-            Outbound::RevTcp(_, o) => o.forwarding(incoming).await,
+            Outbound::Tcp(o) => o.forward(incoming).await,
+            Outbound::RevTcp(o) => o.forward(incoming).await,
         }
     }
 }

@@ -18,8 +18,8 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
+    bound::{io_process, Incoming, Outbound},
     mux::{ChannelId, MuxConnection, MuxConnector},
-    outbound::{io_process, Incoming, Outbound},
     pipe::{PipeReader, PipeWriter},
 };
 
@@ -48,17 +48,25 @@ pub struct RevTcpInbound {
 }
 
 impl RevTcpInbound {
-    pub fn bind_tcp(alias: impl Into<String>, addr: SocketAddr, access_key: String) -> Self {
-        RevTcpInbound::bind(alias.into(), addr, access_key, None)
+    pub fn bind_tcp(
+        alias: impl Into<String>,
+        addr: SocketAddr,
+        access_key: impl Into<String>,
+    ) -> Self {
+        RevTcpInbound::bind(alias.into(), addr, access_key.into(), None)
     }
 
-    pub fn bind_tls(alias: impl Into<String>, addr: SocketAddr, access_key: String) -> Self {
+    pub fn bind_tls(
+        alias: impl Into<String>,
+        addr: SocketAddr,
+        access_key: impl Into<String>,
+    ) -> Self {
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(VerifierDummy {}))
             .with_no_client_auth();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        RevTcpInbound::bind(alias.into(), addr, access_key, Some(tls_connector))
+        RevTcpInbound::bind(alias.into(), addr, access_key.into(), Some(tls_connector))
     }
 
     fn bind(
@@ -88,7 +96,7 @@ impl RevTcpInbound {
             index += 1;
 
             tokio::spawn(async move {
-                let res = outbound.forwarding(Incoming { reader, writer }).await;
+                let res = outbound.forward(Incoming { reader, writer }).await;
                 if let Err(e) = res {
                     log::error!(
                         "error on process ({}) -> ({}). details: {}",
@@ -102,7 +110,7 @@ impl RevTcpInbound {
         Ok(())
     }
 
-    async fn accept(&mut self) -> Result<(ChannelId, PipeReader, PipeWriter), Box<dyn Error>> {
+    async fn accept(&mut self) -> io::Result<(ChannelId, PipeReader, PipeWriter)> {
         loop {
             match self.mux.as_mut() {
                 Some(mux) => {
@@ -135,16 +143,7 @@ impl RevTcpInbound {
                             }
                             None => create_client_mux(stream, &self.access_key).await,
                         },
-                        Err(e) => {
-                            log::error!(
-                                "({}) error at connect to {}. detail: {}",
-                                self.alias,
-                                self.addr,
-                                e
-                            );
-                            time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
+                        Err(e) => Err(e.into()),
                     };
 
                     match res {
@@ -168,18 +167,21 @@ impl RevTcpInbound {
 
 #[derive(Clone)]
 pub struct RevTcpOutbound {
+    alias: String,
     conn_tx: Sender<oneshot::Sender<Option<MuxConnector>>>,
 }
 
 impl RevTcpOutbound {
     pub async fn bind_tcp(
+        alias: impl Into<String>,
         addr: SocketAddr,
         access_keys: Vec<String>,
     ) -> Result<Self, Box<dyn Error>> {
-        RevTcpOutbound::bind(addr, access_keys, None).await
+        RevTcpOutbound::bind(alias.into(), addr, access_keys, None).await
     }
 
     pub async fn bind_tls(
+        alias: impl Into<String>,
         addr: SocketAddr,
         access_keys: Vec<String>,
         cert_chain: Vec<rustls::Certificate>,
@@ -189,10 +191,17 @@ impl RevTcpOutbound {
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key_der)?;
-        RevTcpOutbound::bind(addr, access_keys, Some(TlsAcceptor::from(Arc::new(config)))).await
+        RevTcpOutbound::bind(
+            alias.into(),
+            addr,
+            access_keys,
+            Some(TlsAcceptor::from(Arc::new(config))),
+        )
+        .await
     }
 
     async fn bind(
+        alias: String,
         addr: SocketAddr,
         access_keys: Vec<String>,
         tls_acceptor: Option<TlsAcceptor>,
@@ -256,10 +265,14 @@ impl RevTcpOutbound {
             }
         });
 
-        Ok(Self { conn_tx })
+        Ok(Self { alias, conn_tx })
     }
 
-    pub async fn forwarding<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
@@ -286,7 +299,7 @@ const INVALID_ACCESS_KEY: u8 = 0xFF;
 async fn create_client_mux<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: T,
     access_key: &str,
-) -> Result<MuxConnection, Box<dyn Error>> {
+) -> Result<MuxConnection, Box<dyn Error + Send + Sync>> {
     obtain_access(&mut stream, access_key).await?;
     Ok(MuxConnection::new(stream))
 }
@@ -294,7 +307,7 @@ async fn create_client_mux<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 async fn obtain_access<T: AsyncRead + AsyncWrite + Unpin>(
     mut stream: T,
     access_key: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let buf = access_key.as_bytes();
     stream.write_u8(buf.len() as u8).await?;
     stream.write_all(buf).await?;

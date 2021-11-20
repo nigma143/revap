@@ -6,6 +6,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+#[allow(dead_code)]
 pub fn new_pipe(max_buf_size: usize) -> (PipeWriter, PipeReader) {
     let pipe = Arc::new(Mutex::new(Pipe::new(max_buf_size)));
 
@@ -40,6 +41,7 @@ impl PipeArbiter {
         pipe.close_read();
     }
 
+    #[allow(dead_code)]
     pub fn is_closed(&self) -> bool {
         self.pipe.lock().unwrap().is_closed
     }
