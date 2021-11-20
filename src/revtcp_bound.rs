@@ -84,7 +84,11 @@ impl RevTcpInbound {
         }
     }
 
-    pub async fn forwarding(&mut self, mut outbounds: Vec<Outbound>) -> io::Result<()> {
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub async fn forwarding(&mut self, outbounds: &mut Vec<Outbound>) -> io::Result<()> {
         let mut index = 0;
         while let Ok((_, reader, writer)) = self.accept().await {
             let alias = self.alias.clone();

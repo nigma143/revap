@@ -13,7 +13,14 @@ pub enum Inbound {
 }
 
 impl Inbound {
-    pub async fn forwarding(&mut self, outbounds: Vec<Outbound>) -> io::Result<()> {
+    pub fn alias(&self) -> &str {
+        match self {
+            Inbound::Tcp(o) => o.alias(),
+            Inbound::RevTcp(o) => o.alias(),
+        }
+    }
+
+    pub async fn forwarding(&mut self, outbounds: &mut Vec<Outbound>) -> io::Result<()> {
         match self {
             Inbound::Tcp(o) => o.forwarding(outbounds).await,
             Inbound::RevTcp(o) => o.forwarding(outbounds).await,
