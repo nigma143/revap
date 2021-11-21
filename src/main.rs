@@ -1,8 +1,8 @@
-use std::{env, error::Error, net::SocketAddr, path::Path};
+use std::{error::Error, path::Path};
 
 use bound::Inbound;
-use id_pool::IdPool;
-use tokio::io;
+use tokio::sync::mpsc;
+use tracing::{error, info, info_span, trace, Instrument};
 use yaml_rust::{Yaml, YamlLoader};
 
 use crate::{
@@ -19,7 +19,12 @@ mod tcp_bound;
 
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_target(true)
+        .init();
+
+    //env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let config = {
         let config = std::env::args().nth(1).unwrap_or("revap.yml".into());
@@ -32,36 +37,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let inbounds = create_inbounds(&config["in"]).await?;
     let outbounds = create_outbounds(&config["out"]).await?;
 
-    let mut handles = vec![];
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+
     for (mut inbound, write) in inbounds {
         let mut outbounds: Vec<Outbound> = outbounds
             .iter()
             .filter(|x| write.iter().any(|y| y == x.alias()))
             .map(|x| x.clone())
             .collect();
+        let shutdown = shutdown_tx.clone();
 
-        let handle = tokio::spawn(async move {
-            log::info!(
-                "forwarding: {} -> {}",
-                inbound.alias(),
-                outbounds.iter().map(|x| x.alias()).collect::<Vec<&str>>().join(", ")
-            );
-            let res = inbound.forwarding(&mut outbounds).await;
-            if let Err(e) = res {
-                log::error!(
-                    "forwarding error: {} -> {}. details: {}",
-                    inbound.alias(),
-                    outbounds.iter().map(|x| x.alias()).collect::<Vec<&str>>().join(", "),
-                    e
-                )
-            };
-        });
-        handles.push(handle);
+        let span = info_span!(
+            "process",
+            r#in = inbound.alias(),
+            out = outbounds
+                .iter()
+                .map(|x| x.alias())
+                .collect::<Vec<&str>>()
+                .join(", ")
+                .as_str()
+        );
+
+        tokio::spawn(
+            async move {
+                info!("started");
+                let res = inbound.forwarding(&mut outbounds).await;
+                if let Err(e) = res {
+                    error!("error: {}", e)
+                };
+                let _ = shutdown.send(());
+                info!("end");
+            }
+            .instrument(span),
+        );
     }
 
-    for handle in handles {
-        handle.await.unwrap();
-    }
+    shutdown_rx.recv().await.unwrap();
 
     Ok(())
 }
@@ -146,28 +157,28 @@ async fn create_outbounds(section: &Yaml) -> Result<Vec<Outbound>, Box<dyn Error
 
 fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Error>> {
     match &node[name] {
-        Yaml::BadValue => Err(format!("key {} not found. Node: {:?}", name, node).into()),
+        Yaml::BadValue => Err(format!("key {} not found. node: {:?}", name, node).into()),
         val => val
             .as_str()
-            .ok_or(format!("invalid value as str by key {}. Node: {:?}", name, node).into()),
+            .ok_or(format!("invalid value as str by key {}. node: {:?}", name, node).into()),
     }
 }
 
 fn yaml_as_vec_str<'a>(node: &'a Yaml, name: &str) -> Result<Vec<String>, Box<dyn Error>> {
     match &node[name] {
-        Yaml::BadValue => Err(format!("key {} not found. Node: {:?}", name, node).into()),
+        Yaml::BadValue => Err(format!("key {} not found. node: {:?}", name, node).into()),
         val => match val.as_vec() {
             Some(val) => {
                 let mut res = vec![];
                 for e in val.iter() {
                     let e: Result<_, Box<dyn Error>> = e.as_str().ok_or(
-                        format!("invalid value as str by key {}. Node: {:?}", name, node).into(),
+                        format!("invalid value as str by key {}. node: {:?}", name, node).into(),
                     );
                     res.push(e?.into());
                 }
                 Ok(res)
             }
-            None => Err(format!("key {} is not array. Node: {:?}", name, node).into()),
+            None => Err(format!("key {} is not array. node: {:?}", name, node).into()),
         },
     }
 }

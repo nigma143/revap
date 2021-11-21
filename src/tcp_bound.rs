@@ -12,6 +12,7 @@ use tokio::{
 
 use tokio_rustls::rustls::{self};
 use tokio_rustls::TlsAcceptor;
+use tracing::{Instrument, debug, error, info_span};
 
 use crate::bound::{io_process, Incoming, Outbound};
 
@@ -66,7 +67,7 @@ impl TcpInbound {
 
     pub async fn forwarding(&mut self, outbounds: &mut Vec<Outbound>) -> io::Result<()> {
         let mut index = 0;
-        while let Ok((stream, _rem_addr)) = self.listener.accept().await {
+        while let Ok((stream, rem_addr)) = self.listener.accept().await {
             let alias = self.alias.clone();
             let tls_acceptor = self.tls_acceptor.clone();
 
@@ -76,7 +77,13 @@ impl TcpInbound {
             let mut outbound = outbounds.get_mut(index).unwrap().clone();
             index += 1;
 
+            let span = info_span!(
+                "forwarding",
+                client = format!("{}", rem_addr).as_str(),
+                target = outbound.alias()
+            );
             tokio::spawn(async move {
+                debug!("started");
                 let res = {
                     if let Some(tls_acceptor) = tls_acceptor {
                         match tls_acceptor.accept(stream).await {
@@ -88,14 +95,10 @@ impl TcpInbound {
                     }
                 };
                 if let Err(e) = res {
-                    log::error!(
-                        "error on process ({}) -> ({}). details: {}",
-                        alias,
-                        outbound.alias(),
-                        e
-                    );
+                    error!("{}", e);
                 }
-            });
+                debug!("end");
+            }.instrument(span));
         }
         Ok(())
     }

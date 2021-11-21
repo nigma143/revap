@@ -16,6 +16,7 @@ use tokio::{
     time,
 };
 use tokio_rustls::TlsAcceptor;
+use tracing::{debug, error, info_span, Instrument};
 
 use crate::{
     bound::{io_process, Incoming, Outbound},
@@ -90,26 +91,29 @@ impl RevTcpInbound {
 
     pub async fn forwarding(&mut self, outbounds: &mut Vec<Outbound>) -> io::Result<()> {
         let mut index = 0;
-        while let Ok((_, reader, writer)) = self.accept().await {
-            let alias = self.alias.clone();
-
+        while let Ok((id, reader, writer)) = self.accept().await {
             if index >= outbounds.len() {
                 index = 0;
             }
             let mut outbound = outbounds.get_mut(index).unwrap().clone();
             index += 1;
 
-            tokio::spawn(async move {
-                let res = outbound.forward(Incoming { reader, writer }).await;
-                if let Err(e) = res {
-                    log::error!(
-                        "error on process ({}) -> ({}). details: {}",
-                        alias,
-                        outbound.alias(),
-                        e
-                    );
+            let span = info_span!(
+                "forwarding",
+                client = format!("{}", id).as_str(),
+                target = outbound.alias()
+            );
+            tokio::spawn(
+                async move {
+                    debug!("started");
+                    let res = outbound.forward(Incoming { reader, writer }).await;
+                    if let Err(e) = res {
+                        error!("{}", e);
+                    }
+                    debug!("end");
                 }
-            });
+                .instrument(span),
+            );
         }
         Ok(())
     }
@@ -123,9 +127,8 @@ impl RevTcpInbound {
                             return Ok(channel);
                         }
                         Err(e) => {
-                            log::error!(
-                                "({}) error at listen mux channel from {}. detail: {}",
-                                self.alias,
+                            error!(
+                                "listen mux channel from {}. {}",
                                 self.addr,
                                 e
                             );
@@ -153,9 +156,8 @@ impl RevTcpInbound {
                     match res {
                         Ok(mux) => self.mux = Some(mux),
                         Err(e) => {
-                            log::error!(
-                                "({}) error at connect to {}. detail: {}",
-                                self.alias,
+                            error!(
+                                "connect to {}. {}",
                                 self.addr,
                                 e
                             );
@@ -258,7 +260,7 @@ impl RevTcpOutbound {
                         Ok(mux) => pool.lock().unwrap().push(mux),
                         Err(e) => {
                             log::error!(
-                                "error at accept on {} from {}. detail: {}",
+                                "accept on {} from {}. {}",
                                 addr,
                                 rem_addr,
                                 e

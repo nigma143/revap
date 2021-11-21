@@ -181,7 +181,7 @@ impl MuxConnection {
 
         tokio::spawn(async move {
             if let Err(e) = connection_loop(write, read, listen_tx, new_rx).await {
-                log::debug!("connection loop end with error: {}", e);
+                log::trace!("connection loop end with error: {}", e);
             }
         });
 
@@ -255,7 +255,7 @@ where
         if let Err(e) = async move {
             loop {
                 let frame = output_rx.recv().await.ok_or("recv channel closed")?;
-                log::debug!("<- {}", frame);
+                log::trace!("<- {}", frame);
                 write_frame(&mut write, frame).await?;
             }
             #[allow(unreachable_code)]
@@ -263,7 +263,7 @@ where
         }
         .await
         {
-            log::debug!("transport write loop end with error: {}", e);
+            log::trace!("transport write loop end with error: {}", e);
         }
     });
 
@@ -272,7 +272,7 @@ where
         if let Err(e) = async move {
             loop {
                 let frame = read_frame(&mut read).await?;
-                log::debug!("-> {}", frame);
+                log::trace!("-> {}", frame);
                 input_tx.send(frame).await?;
             }
             #[allow(unreachable_code)]
@@ -280,7 +280,7 @@ where
         }
         .await
         {
-            log::debug!("transport read loop end with error: {}", e);
+            log::trace!("transport read loop end with error: {}", e);
         }
     });
 
@@ -440,7 +440,7 @@ fn spawn_channel_read(
         }
         .await
         {
-            log::debug!("mux {} read loop end with error: {}", id, e);
+            log::trace!("mux {} read loop end with error: {}", id, e);
         }
     })
 }
