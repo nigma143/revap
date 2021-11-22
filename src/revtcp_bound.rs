@@ -16,7 +16,7 @@ use tokio::{
     time,
 };
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info_span, Instrument};
+use tracing::{debug, error, info, info_span, Instrument};
 
 use crate::{
     bound::{io_process, Incoming, Outbound},
@@ -100,7 +100,7 @@ impl RevTcpInbound {
 
             let span = info_span!(
                 "forwarding",
-                client = format!("{}", id).as_str(),
+                client = %id,
                 target = outbound.alias()
             );
             tokio::spawn(
@@ -108,7 +108,7 @@ impl RevTcpInbound {
                     debug!("started");
                     let res = outbound.forward(Incoming { reader, writer }).await;
                     if let Err(e) = res {
-                        error!("{}", e);
+                        debug!("{}", e);
                     }
                     debug!("end");
                 }
@@ -127,11 +127,7 @@ impl RevTcpInbound {
                             return Ok(channel);
                         }
                         Err(e) => {
-                            error!(
-                                "listen mux channel from {}. {}",
-                                self.addr,
-                                e
-                            );
+                            error!("listen mux channel from {}. {}", self.addr, e);
                             self.mux = None;
                         }
                     };
@@ -154,13 +150,12 @@ impl RevTcpInbound {
                     };
 
                     match res {
-                        Ok(mux) => self.mux = Some(mux),
+                        Ok(mux) => {
+                            info!("connected to mux-server {}", self.addr);
+                            self.mux = Some(mux);
+                        }
                         Err(e) => {
-                            error!(
-                                "connect to {}. {}",
-                                self.addr,
-                                e
-                            );
+                            error!("connecting to mux-server {}. {}", self.addr, e);
                             time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -257,14 +252,12 @@ impl RevTcpOutbound {
                         None => create_server_mux(stream, access_keys).await,
                     };
                     match res {
-                        Ok(mux) => pool.lock().unwrap().push(mux),
+                        Ok(mux) => {
+                            info!("connected mux-agent on {} from {}", addr, rem_addr);
+                            pool.lock().unwrap().push(mux);
+                        }
                         Err(e) => {
-                            log::error!(
-                                "accept on {} from {}. {}",
-                                addr,
-                                rem_addr,
-                                e
-                            );
+                            error!("accepting mux-agent on {} from {}. {}", addr, rem_addr, e);
                         }
                     }
                 });

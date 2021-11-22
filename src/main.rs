@@ -2,7 +2,7 @@ use std::{error::Error, path::Path};
 
 use bound::Inbound;
 use tokio::sync::mpsc;
-use tracing::{error, info, info_span, trace, Instrument};
+use tracing::{error, info, info_span, Instrument};
 use yaml_rust::{Yaml, YamlLoader};
 
 use crate::{
@@ -20,16 +20,13 @@ mod tcp_bound;
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_target(true)
+        .with_max_level(tracing::Level::INFO)
         .init();
-
-    //env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let config = {
         let config = std::env::args().nth(1).unwrap_or("revap.yml".into());
         let content = std::fs::read_to_string(&config)
-            .map_err(|e| format!("config file {}. details: {}", config, e))?;
+            .map_err(|e| format!("config file {}. {}", config, e))?;
         YamlLoader::load_from_str(&content).unwrap()
     };
     let config = &config[0];
@@ -50,12 +47,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let span = info_span!(
             "process",
             r#in = inbound.alias(),
-            out = outbounds
+            out = %outbounds
                 .iter()
                 .map(|x| x.alias())
                 .collect::<Vec<&str>>()
                 .join(", ")
-                .as_str()
         );
 
         tokio::spawn(
@@ -72,7 +68,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    shutdown_rx.recv().await.unwrap();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = shutdown_rx.recv() => {},
+    }
 
     Ok(())
 }

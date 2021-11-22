@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 log = "0.4.0"
-env_logger = "0.9.0"
 
 tracing = "0.1.29"
 tracing-futures = { version = "0.2.5" }
@@ -15,6 +14,7 @@ tracing-subscriber = "0.3.2"
 
 tokio = { version = "1.12.0", features = ["full"] }
 tokio-util = { version = "0.6.8", features = ["compat"] }
+tokio-signal = "0.2.9" 
 async-trait = "0.1.51"
 rustls = { version = "0.20.0", features = ["dangerous_configuration"] }
 tokio-rustls = { git = "https://github.com/tokio-rs/tls", branch = "master" }

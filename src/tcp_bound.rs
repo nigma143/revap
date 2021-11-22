@@ -12,7 +12,7 @@ use tokio::{
 
 use tokio_rustls::rustls::{self};
 use tokio_rustls::TlsAcceptor;
-use tracing::{Instrument, debug, error, info_span};
+use tracing::{debug, error, info_span, Instrument};
 
 use crate::bound::{io_process, Incoming, Outbound};
 
@@ -68,7 +68,6 @@ impl TcpInbound {
     pub async fn forwarding(&mut self, outbounds: &mut Vec<Outbound>) -> io::Result<()> {
         let mut index = 0;
         while let Ok((stream, rem_addr)) = self.listener.accept().await {
-            let alias = self.alias.clone();
             let tls_acceptor = self.tls_acceptor.clone();
 
             if index >= outbounds.len() {
@@ -82,23 +81,26 @@ impl TcpInbound {
                 client = format!("{}", rem_addr).as_str(),
                 target = outbound.alias()
             );
-            tokio::spawn(async move {
-                debug!("started");
-                let res = {
-                    if let Some(tls_acceptor) = tls_acceptor {
-                        match tls_acceptor.accept(stream).await {
-                            Ok(stream) => TcpInbound::s_forwarding(stream, &mut outbound).await,
-                            Err(e) => Err(e),
+            tokio::spawn(
+                async move {
+                    debug!("started");
+                    let res = {
+                        if let Some(tls_acceptor) = tls_acceptor {
+                            match tls_acceptor.accept(stream).await {
+                                Ok(stream) => TcpInbound::s_forwarding(stream, &mut outbound).await,
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            TcpInbound::s_forwarding(stream, &mut outbound).await
                         }
-                    } else {
-                        TcpInbound::s_forwarding(stream, &mut outbound).await
+                    };
+                    if let Err(e) = res {
+                        debug!("{}", e);
                     }
-                };
-                if let Err(e) = res {
-                    error!("{}", e);
+                    debug!("end");
                 }
-                debug!("end");
-            }.instrument(span));
+                .instrument(span),
+            );
         }
         Ok(())
     }
