@@ -19,9 +19,9 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, info_span, Instrument};
 
 use crate::{
-    bound::{io_process, Incoming, Outbound},
+    bound::{io_process, Gateway, Incoming},
     mux::{ChannelId, MuxConnection, MuxConnector},
-    pipe::{PipeReader, PipeWriter},
+    pipe::{PipeReader, PipeWriter}, balancing::LoadBalancing,
 };
 
 struct VerifierDummy;
@@ -41,7 +41,6 @@ impl rustls::client::ServerCertVerifier for VerifierDummy {
 }
 
 pub struct RevTcpInbound {
-    alias: String,
     addr: SocketAddr,
     access_key: String,
     tls_connector: Option<tokio_rustls::TlsConnector>,
@@ -49,35 +48,25 @@ pub struct RevTcpInbound {
 }
 
 impl RevTcpInbound {
-    pub fn bind_tcp(
-        alias: impl Into<String>,
-        addr: SocketAddr,
-        access_key: impl Into<String>,
-    ) -> Self {
-        RevTcpInbound::bind(alias.into(), addr, access_key.into(), None)
+    pub fn bind_tcp(addr: SocketAddr, access_key: impl Into<String>) -> Self {
+        RevTcpInbound::bind(addr, access_key.into(), None)
     }
 
-    pub fn bind_tls(
-        alias: impl Into<String>,
-        addr: SocketAddr,
-        access_key: impl Into<String>,
-    ) -> Self {
+    pub fn bind_tls(addr: SocketAddr, access_key: impl Into<String>) -> Self {
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(VerifierDummy {}))
             .with_no_client_auth();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        RevTcpInbound::bind(alias.into(), addr, access_key.into(), Some(tls_connector))
+        RevTcpInbound::bind(addr, access_key.into(), Some(tls_connector))
     }
 
     fn bind(
-        alias: String,
         addr: SocketAddr,
         access_key: String,
         tls_connector: Option<tokio_rustls::TlsConnector>,
     ) -> Self {
         Self {
-            alias,
             addr,
             access_key,
             tls_connector,
@@ -85,28 +74,19 @@ impl RevTcpInbound {
         }
     }
 
-    pub fn alias(&self) -> &str {
-        &self.alias
-    }
-
-    pub async fn forwarding(&mut self, outbounds: &mut Vec<Outbound>) -> io::Result<()> {
+    pub async fn forwarding(&mut self, gateways: &mut LoadBalancing) -> io::Result<()> {
         let mut index = 0;
         while let Ok((id, reader, writer)) = self.accept().await {
-            if index >= outbounds.len() {
-                index = 0;
-            }
-            let mut outbound = outbounds.get_mut(index).unwrap().clone();
-            index += 1;
-
+            let mut gateway = gateways.select().clone();
             let span = info_span!(
                 "forwarding",
                 client = %id,
-                target = outbound.alias()
+                target = gateway.alias()
             );
             tokio::spawn(
                 async move {
                     debug!("started");
-                    let res = outbound.forward(Incoming { reader, writer }).await;
+                    let res = gateway.forward(Incoming { reader, writer }).await;
                     if let Err(e) = res {
                         debug!("{}", e);
                     }
@@ -168,21 +148,18 @@ impl RevTcpInbound {
 
 #[derive(Clone)]
 pub struct RevTcpOutbound {
-    alias: String,
     conn_tx: Sender<oneshot::Sender<Option<MuxConnector>>>,
 }
 
 impl RevTcpOutbound {
     pub async fn bind_tcp(
-        alias: impl Into<String>,
         addr: SocketAddr,
         access_keys: Vec<String>,
     ) -> Result<Self, Box<dyn Error>> {
-        RevTcpOutbound::bind(alias.into(), addr, access_keys, None).await
+        RevTcpOutbound::bind(addr, access_keys, None).await
     }
 
     pub async fn bind_tls(
-        alias: impl Into<String>,
         addr: SocketAddr,
         access_keys: Vec<String>,
         cert_chain: Vec<rustls::Certificate>,
@@ -192,17 +169,10 @@ impl RevTcpOutbound {
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key_der)?;
-        RevTcpOutbound::bind(
-            alias.into(),
-            addr,
-            access_keys,
-            Some(TlsAcceptor::from(Arc::new(config))),
-        )
-        .await
+        RevTcpOutbound::bind(addr, access_keys, Some(TlsAcceptor::from(Arc::new(config)))).await
     }
 
     async fn bind(
-        alias: String,
         addr: SocketAddr,
         access_keys: Vec<String>,
         tls_acceptor: Option<TlsAcceptor>,
@@ -264,11 +234,7 @@ impl RevTcpOutbound {
             }
         });
 
-        Ok(Self { alias, conn_tx })
-    }
-
-    pub fn alias(&self) -> &str {
-        &self.alias
+        Ok(Self { conn_tx })
     }
 
     pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>

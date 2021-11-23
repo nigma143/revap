@@ -2,7 +2,7 @@ use std::{
     error::Error,
     io::{self},
     net::SocketAddr,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
 };
 
 use tokio::{
@@ -12,26 +12,21 @@ use tokio::{
 
 use tokio_rustls::rustls::{self};
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info_span, Instrument};
+use tracing::{debug, info_span, Instrument};
 
-use crate::bound::{io_process, Incoming, Outbound};
+use crate::{bound::{io_process, Gateway, Incoming, Outbound}, balancing::LoadBalancing};
 
 pub struct TcpInbound {
-    alias: String,
     listener: TcpListener,
     tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl TcpInbound {
-    pub async fn bind_tcp(
-        alias: impl Into<String>,
-        addr: SocketAddr,
-    ) -> Result<Self, Box<dyn Error>> {
-        TcpInbound::bind(alias.into(), addr, None).await
+    pub async fn bind_tcp(addr: SocketAddr) -> Result<Self, Box<dyn Error>> {
+        TcpInbound::bind(addr, None).await
     }
 
     pub async fn bind_tls(
-        alias: impl Into<String>,
         addr: SocketAddr,
         cert_chain: Vec<rustls::Certificate>,
         key_der: rustls::PrivateKey,
@@ -40,46 +35,29 @@ impl TcpInbound {
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key_der)?;
-        TcpInbound::bind(
-            alias.into(),
-            addr,
-            Some(TlsAcceptor::from(Arc::new(config))),
-        )
-        .await
+        TcpInbound::bind(addr, Some(TlsAcceptor::from(Arc::new(config)))).await
     }
 
     async fn bind(
-        alias: String,
         addr: SocketAddr,
         tls_acceptor: Option<TlsAcceptor>,
     ) -> Result<Self, Box<dyn Error>> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
-            alias,
             listener,
             tls_acceptor,
         })
     }
 
-    pub fn alias(&self) -> &str {
-        &self.alias
-    }
-
-    pub async fn forwarding(&mut self, outbounds: &mut Vec<Outbound>) -> io::Result<()> {
+    pub async fn forwarding(&mut self, gateways: &mut LoadBalancing) -> io::Result<()> {
         let mut index = 0;
         while let Ok((stream, rem_addr)) = self.listener.accept().await {
             let tls_acceptor = self.tls_acceptor.clone();
-
-            if index >= outbounds.len() {
-                index = 0;
-            }
-            let mut outbound = outbounds.get_mut(index).unwrap().clone();
-            index += 1;
-
+            let mut gateway = gateways.select().clone();
             let span = info_span!(
                 "forwarding",
                 client = format!("{}", rem_addr).as_str(),
-                target = outbound.alias()
+                target = gateway.alias()
             );
             tokio::spawn(
                 async move {
@@ -87,11 +65,11 @@ impl TcpInbound {
                     let res = {
                         if let Some(tls_acceptor) = tls_acceptor {
                             match tls_acceptor.accept(stream).await {
-                                Ok(stream) => TcpInbound::s_forwarding(stream, &mut outbound).await,
+                                Ok(stream) => TcpInbound::s_forwarding(stream, &mut gateway).await,
                                 Err(e) => Err(e),
                             }
                         } else {
-                            TcpInbound::s_forwarding(stream, &mut outbound).await
+                            TcpInbound::s_forwarding(stream, &mut gateway).await
                         }
                     };
                     if let Err(e) = res {
@@ -107,7 +85,7 @@ impl TcpInbound {
 
     async fn s_forwarding<S: AsyncRead + AsyncWrite>(
         stream: S,
-        outbound: &mut Outbound,
+        outbound: &mut Gateway,
     ) -> io::Result<()> {
         let (reader, writer) = split(stream);
         outbound.forward(Incoming { reader, writer }).await
@@ -116,7 +94,6 @@ impl TcpInbound {
 
 #[derive(Clone)]
 pub struct TcpOutbound {
-    alias: String,
     addr: SocketAddr,
     tls_connector: Option<tokio_rustls::TlsConnector>,
 }
@@ -138,33 +115,24 @@ impl rustls::client::ServerCertVerifier for VerifierDummy {
 }
 
 impl TcpOutbound {
-    pub fn new_tcp(alias: impl Into<String>, addr: SocketAddr) -> Self {
-        TcpOutbound::new(alias.into(), addr, None)
+    pub fn new_tcp(addr: SocketAddr) -> Self {
+        TcpOutbound::new(addr, None)
     }
 
-    pub fn new_tls(alias: impl Into<String>, addr: SocketAddr) -> Self {
+    pub fn new_tls(addr: SocketAddr) -> Self {
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(VerifierDummy {}))
             .with_no_client_auth();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        TcpOutbound::new(alias.into(), addr, Some(tls_connector))
+        TcpOutbound::new(addr, Some(tls_connector))
     }
 
-    fn new(
-        alias: String,
-        addr: SocketAddr,
-        tls_connector: Option<tokio_rustls::TlsConnector>,
-    ) -> Self {
+    fn new(addr: SocketAddr, tls_connector: Option<tokio_rustls::TlsConnector>) -> Self {
         Self {
-            alias,
             addr,
             tls_connector,
         }
-    }
-
-    pub fn alias(&self) -> &str {
-        &self.alias
     }
 
     pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>

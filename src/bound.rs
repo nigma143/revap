@@ -1,11 +1,98 @@
-use std::io;
+use std::{
+    io,
+    ops::{Deref, DerefMut},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::mpsc::UnboundedSender,
+};
+use tracing::{error, info, info_span};
 
 use crate::{
+    balancing::LoadBalancing,
     revtcp_bound::{RevTcpInbound, RevTcpOutbound},
     tcp_bound::{TcpInbound, TcpOutbound},
 };
+
+pub struct Forwarder {
+    pub alias: String,
+    pub inbound: Inbound,
+    gateways: LoadBalancing,
+}
+
+impl Forwarder {
+    pub fn new(alias: String, inbound: Inbound, gateways: LoadBalancing) -> Self {
+        Self {
+            alias,
+            inbound,            
+            gateways
+        }
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub async fn run(&mut self, shutdown: UnboundedSender<()>) {
+        let span = info_span!(
+            "process",
+            r#in = %self.alias,
+            out = %self.gateways
+                .iter()
+                .map(|x| x.alias())
+                .collect::<Vec<&str>>()
+                .join(", ")
+        );
+        info!("started");         
+        let res = self.inbound.forwarding(&mut self.gateways).await;
+        if let Err(e) = res {
+            error!("error: {}", e)
+        };
+        let _ = shutdown.send(());
+        info!("end");
+    }
+}
+
+#[derive(Clone)]
+pub struct Gateway {
+    pub alias: String,
+    pub outbound: Outbound,
+    pub active_conn: Arc<AtomicUsize>,
+}
+
+impl Gateway {
+    pub fn new(alias: String, outbound: Outbound) -> Self {
+        Self {
+            alias,
+            outbound,
+            active_conn: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub fn active_conn(&self) -> usize {
+        self.active_conn.load(Ordering::Relaxed)
+    }
+
+    pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+        R: AsyncRead + Unpin,
+    {
+        self.active_conn.fetch_add(1, Ordering::Relaxed);
+        let res = self.outbound.forward(incoming).await;
+        self.active_conn.fetch_sub(1, Ordering::Relaxed);
+        res
+    }
+}
 
 pub enum Inbound {
     Tcp(TcpInbound),
@@ -13,17 +100,10 @@ pub enum Inbound {
 }
 
 impl Inbound {
-    pub fn alias(&self) -> &str {
+    pub async fn forwarding(&mut self, gateways: &mut LoadBalancing) -> io::Result<()> {
         match self {
-            Inbound::Tcp(o) => o.alias(),
-            Inbound::RevTcp(o) => o.alias(),
-        }
-    }
-
-    pub async fn forwarding(&mut self, outbounds: &mut Vec<Outbound>) -> io::Result<()> {
-        match self {
-            Inbound::Tcp(o) => o.forwarding(outbounds).await,
-            Inbound::RevTcp(o) => o.forwarding(outbounds).await,
+            Inbound::Tcp(o) => o.forwarding(gateways).await,
+            Inbound::RevTcp(o) => o.forwarding(gateways).await,
         }
     }
 }
@@ -40,13 +120,6 @@ pub enum Outbound {
 }
 
 impl Outbound {
-    pub fn alias(&self) -> &str {
-        match self {
-            Outbound::Tcp(o) => o.alias(),
-            Outbound::RevTcp(o) => o.alias(),
-        }
-    }
-
     pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,

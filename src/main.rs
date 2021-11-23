@@ -1,6 +1,6 @@
 use std::{error::Error, path::Path};
 
-use bound::Inbound;
+use bound::{Gateway, Inbound, Listener};
 use tokio::sync::mpsc;
 use tracing::{error, info, info_span, Instrument};
 use yaml_rust::{Yaml, YamlLoader};
@@ -11,6 +11,7 @@ use crate::{
     tcp_bound::{TcpInbound, TcpOutbound},
 };
 
+mod balancing;
 mod bound;
 pub mod mux;
 mod pipe;
@@ -31,13 +32,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let config = &config[0];
 
-    let inbounds = create_inbounds(&config["in"]).await?;
-    let outbounds = create_outbounds(&config["out"]).await?;
+    let gateways = create_gateways(&config["out"]).await?;
+    let listeners = create_listeners(&config["in"]).await?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
 
-    for (mut inbound, write) in inbounds {
-        let mut outbounds: Vec<Outbound> = outbounds
+    for (mut listener, write) in listeners {
+        let mut gateways: Vec<Gateway> = gateways
             .iter()
             .filter(|x| write.iter().any(|y| y == x.alias()))
             .map(|x| x.clone())
@@ -46,8 +47,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let span = info_span!(
             "process",
-            r#in = inbound.alias(),
-            out = %outbounds
+            r#in = listener.alias(),
+            out = %gateways
                 .iter()
                 .map(|x| x.alias())
                 .collect::<Vec<&str>>()
@@ -57,7 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(
             async move {
                 info!("started");
-                let res = inbound.forwarding(&mut outbounds).await;
+                let res = listener.forwarding(&mut gateways).await;
                 if let Err(e) = res {
                     error!("error: {}", e)
                 };
@@ -76,8 +77,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn create_inbounds(section: &Yaml) -> Result<Vec<(Inbound, Vec<String>)>, Box<dyn Error>> {
-    let mut inbounds = vec![];
+async fn create_listeners(
+    section: &Yaml,
+    gateways: &mut Vec<Gateway>,
+) -> Result<Vec<(Listener, Vec<String>)>, Box<dyn Error>> {
+    let mut listeners = vec![];
     for o in section.as_hash() {
         for (alias, opts) in o.iter() {
             let alias = alias.as_str().unwrap();
@@ -86,7 +90,7 @@ async fn create_inbounds(section: &Yaml) -> Result<Vec<(Inbound, Vec<String>)>, 
             let inbound = match proto {
                 "tcp" => {
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
-                    Inbound::Tcp(TcpInbound::bind_tcp(alias, listen).await?)
+                    Inbound::Tcp(TcpInbound::bind_tcp(listen).await?)
                 }
                 "tls" => {
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
@@ -94,28 +98,29 @@ async fn create_inbounds(section: &Yaml) -> Result<Vec<(Inbound, Vec<String>)>, 
                     let key_der_path = yaml_as_str(opts, "private-key")?;
                     let cert_chain = load_certs(Path::new(cert_chain_path))?;
                     let key_der = load_keys(Path::new(key_der_path))?.remove(0);
-                    Inbound::Tcp(TcpInbound::bind_tls(alias, listen, cert_chain, key_der).await?)
+                    Inbound::Tcp(TcpInbound::bind_tls(listen, cert_chain, key_der).await?)
                 }
                 "revtcp" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
                     let access_key = yaml_as_str(opts, "access-key")?;
-                    Inbound::RevTcp(RevTcpInbound::bind_tcp(alias, endpoint, access_key))
+                    Inbound::RevTcp(RevTcpInbound::bind_tcp(endpoint, access_key))
                 }
                 "revtls" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
                     let access_key = yaml_as_str(opts, "access-key")?;
-                    Inbound::RevTcp(RevTcpInbound::bind_tls(alias, endpoint, access_key))
+                    Inbound::RevTcp(RevTcpInbound::bind_tls(endpoint, access_key))
                 }
                 _ => panic!("protocol `{}` not supported", proto),
             };
-            inbounds.push((inbound, write));
+            let listener = Listener::new(alias.into(), inbound);
+            listeners.push((listener, write));
         }
     }
-    Ok(inbounds)
+    Ok(listeners)
 }
 
-async fn create_outbounds(section: &Yaml) -> Result<Vec<Outbound>, Box<dyn Error>> {
-    let mut outbounds = vec![];
+async fn create_gateways(section: &Yaml) -> Result<Vec<Gateway>, Box<dyn Error>> {
+    let mut gateways = vec![];
     for o in section.as_hash() {
         for (alias, opts) in o.iter() {
             let alias = alias.as_str().unwrap();
@@ -123,16 +128,16 @@ async fn create_outbounds(section: &Yaml) -> Result<Vec<Outbound>, Box<dyn Error
             let outbound = match proto {
                 "tcp" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
-                    Outbound::Tcp(TcpOutbound::new_tcp(alias, endpoint))
+                    Outbound::Tcp(TcpOutbound::new_tcp(endpoint))
                 }
                 "tls" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
-                    Outbound::Tcp(TcpOutbound::new_tls(alias, endpoint))
+                    Outbound::Tcp(TcpOutbound::new_tls(endpoint))
                 }
                 "revtcp" => {
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
                     let access_keys = yaml_as_vec_str(opts, "access-keys")?;
-                    Outbound::RevTcp(RevTcpOutbound::bind_tcp(alias, listen, access_keys).await?)
+                    Outbound::RevTcp(RevTcpOutbound::bind_tcp(listen, access_keys).await?)
                 }
                 "revtls" => {
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
@@ -142,16 +147,16 @@ async fn create_outbounds(section: &Yaml) -> Result<Vec<Outbound>, Box<dyn Error
                     let cert_chain = load_certs(Path::new(cert_chain_path))?;
                     let key_der = load_keys(Path::new(key_der_path))?.remove(0);
                     Outbound::RevTcp(
-                        RevTcpOutbound::bind_tls(alias, listen, access_keys, cert_chain, key_der)
-                            .await?,
+                        RevTcpOutbound::bind_tls(listen, access_keys, cert_chain, key_der).await?,
                     )
                 }
                 _ => panic!("protocol `{}` not supported", proto),
             };
-            outbounds.push(outbound);
+            let gateway = Gateway::new(alias.into(), outbound);
+            gateways.push(gateway);
         }
     }
-    Ok(outbounds)
+    Ok(gateways)
 }
 
 fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Error>> {
