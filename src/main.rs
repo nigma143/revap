@@ -21,7 +21,7 @@ mod tcp_bound;
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .init();
 
     let config = {
@@ -57,7 +57,7 @@ async fn create_forwarders(section: &Yaml) -> Result<Vec<Forwarder>, Box<dyn Err
         for (alias, opts) in o.iter() {
             let alias = alias.as_str().unwrap();
             let proto = yaml_as_str(opts, "proto")?;
-            let balance = yaml_as_str(opts, "balance")?;
+            let balance = yaml_as_str(opts, "balance").unwrap_or("roundrobin");
             let write = yaml_as_vec_str(opts, "write")?;
             let inbound = match proto {
                 "tcp" => {

@@ -81,7 +81,7 @@ impl RevTcpInbound {
             let span = info_span!(
                 "forwarding",
                 client = %id,
-                target = gateway.alias()
+                target = %gateway.alias()
             );
             tokio::spawn(
                 async move {

@@ -10,7 +10,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc::UnboundedSender,
 };
-use tracing::{error, info, info_span};
+use tracing::{error, info, info_span, Instrument};
 
 use crate::{
     balancing::LoadBalancing,
@@ -34,7 +34,7 @@ impl Forwarder {
     }
 
     pub async fn run(&mut self, shutdown: UnboundedSender<()>) {
-        let _span = info_span!(
+        let span = info_span!(
             "run",
             r#in = %self.alias,
             out = %self.gateways
@@ -43,21 +43,25 @@ impl Forwarder {
                 .collect::<Vec<&str>>()
                 .join(", ")
         );
-        info!("started");
-        let res = self.inbound.forwarding(&mut self.gateways).await;
-        if let Err(e) = res {
-            error!("error: {}", e)
+        let fut = async {
+            info!("started");
+            let res = self.inbound.forwarding(&mut self.gateways).await;
+            if let Err(e) = res {
+                error!("error: {}", e)
+            };
+            let _ = shutdown.send(());
+            info!("end");
         };
-        let _ = shutdown.send(());
-        info!("end");
+
+        fut.instrument(span).await;
     }
 }
 
 #[derive(Clone)]
 pub struct Gateway {
-    pub alias: String,
-    pub outbound: Outbound,
-    pub active_conn: Arc<AtomicUsize>,
+    alias: String,
+    outbound: Outbound,
+    active_conn: Arc<AtomicUsize>,
 }
 
 impl Gateway {

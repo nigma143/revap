@@ -2,7 +2,7 @@ use std::{
     error::Error,
     io::{self},
     net::SocketAddr,
-    sync::{Arc},
+    sync::Arc,
 };
 
 use tokio::{
@@ -58,8 +58,8 @@ impl TcpInbound {
             let mut gateway = gateways.select().clone();
             let span = info_span!(
                 "forwarding",
-                client = format!("{}", rem_addr).as_str(),
-                target = gateway.alias()
+                client = %rem_addr,
+                target = %gateway.alias()
             );
             tokio::spawn(
                 async move {
