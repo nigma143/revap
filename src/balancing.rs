@@ -1,6 +1,6 @@
 use std::ops::Deref;
 
-use crate::bound::{Gateway};
+use crate::bound::Gateway;
 
 pub enum LoadBalancing {
     RoundRobin(RoundRobin),
@@ -8,6 +8,14 @@ pub enum LoadBalancing {
 }
 
 impl LoadBalancing {
+    pub fn round_robin(gateways: Vec<Gateway>) -> Self {
+        LoadBalancing::RoundRobin(RoundRobin::new(gateways))
+    }
+
+    pub fn least_conn(gateways: Vec<Gateway>) -> Self {
+        LoadBalancing::LeastConn(LeastConn::new(gateways))
+    }
+
     pub fn select(&mut self) -> &mut Gateway {
         match self {
             LoadBalancing::RoundRobin(o) => o.select(),
@@ -36,7 +44,7 @@ impl RoundRobin {
     pub fn new(gateways: Vec<Gateway>) -> Self {
         Self { index: 0, gateways }
     }
-    
+
     pub fn select(&mut self) -> &mut Gateway {
         let mut index = self.index;
         if index >= self.gateways.len() {
@@ -65,8 +73,7 @@ impl LeastConn {
     }
 
     pub fn select(&mut self) -> &mut Gateway {
-        self
-            .gateways
+        self.gateways
             .iter_mut()
             .min_by_key(|x| x.active_conn())
             .unwrap()
@@ -80,4 +87,3 @@ impl Deref for LeastConn {
         &self.gateways
     }
 }
-

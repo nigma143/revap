@@ -2,7 +2,7 @@ use std::{
     error::Error,
     io::{self},
     net::SocketAddr,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc},
 };
 
 use tokio::{
@@ -14,7 +14,10 @@ use tokio_rustls::rustls::{self};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info_span, Instrument};
 
-use crate::{bound::{io_process, Gateway, Incoming, Outbound}, balancing::LoadBalancing};
+use crate::{
+    balancing::LoadBalancing,
+    bound::{io_process, Gateway, Incoming},
+};
 
 pub struct TcpInbound {
     listener: TcpListener,
@@ -50,7 +53,6 @@ impl TcpInbound {
     }
 
     pub async fn forwarding(&mut self, gateways: &mut LoadBalancing) -> io::Result<()> {
-        let mut index = 0;
         while let Ok((stream, rem_addr)) = self.listener.accept().await {
             let tls_acceptor = self.tls_acceptor.clone();
             let mut gateway = gateways.select().clone();

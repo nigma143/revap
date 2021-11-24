@@ -1,6 +1,5 @@
 use std::{
     io,
-    ops::{Deref, DerefMut},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -29,18 +28,14 @@ impl Forwarder {
     pub fn new(alias: String, inbound: Inbound, gateways: LoadBalancing) -> Self {
         Self {
             alias,
-            inbound,            
-            gateways
+            inbound,
+            gateways,
         }
     }
 
-    pub fn alias(&self) -> &str {
-        &self.alias
-    }
-
     pub async fn run(&mut self, shutdown: UnboundedSender<()>) {
-        let span = info_span!(
-            "process",
+        let _span = info_span!(
+            "run",
             r#in = %self.alias,
             out = %self.gateways
                 .iter()
@@ -48,7 +43,7 @@ impl Forwarder {
                 .collect::<Vec<&str>>()
                 .join(", ")
         );
-        info!("started");         
+        info!("started");
         let res = self.inbound.forwarding(&mut self.gateways).await;
         if let Err(e) = res {
             error!("error: {}", e)

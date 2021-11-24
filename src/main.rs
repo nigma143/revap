@@ -1,12 +1,12 @@
 use std::{error::Error, path::Path};
 
-use bound::{Gateway, Inbound, Listener};
+use bound::{Gateway, Inbound};
 use tokio::sync::mpsc;
-use tracing::{error, info, info_span, Instrument};
 use yaml_rust::{Yaml, YamlLoader};
 
 use crate::{
-    bound::Outbound,
+    balancing::LoadBalancing,
+    bound::{Forwarder, Outbound},
     revtcp_bound::{RevTcpInbound, RevTcpOutbound},
     tcp_bound::{TcpInbound, TcpOutbound},
 };
@@ -32,41 +32,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let config = &config[0];
 
-    let gateways = create_gateways(&config["out"]).await?;
-    let listeners = create_listeners(&config["in"]).await?;
+    let forwarders = create_forwarders(&config).await?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
 
-    for (mut listener, write) in listeners {
-        let mut gateways: Vec<Gateway> = gateways
-            .iter()
-            .filter(|x| write.iter().any(|y| y == x.alias()))
-            .map(|x| x.clone())
-            .collect();
+    for mut forwarder in forwarders {
         let shutdown = shutdown_tx.clone();
-
-        let span = info_span!(
-            "process",
-            r#in = listener.alias(),
-            out = %gateways
-                .iter()
-                .map(|x| x.alias())
-                .collect::<Vec<&str>>()
-                .join(", ")
-        );
-
-        tokio::spawn(
-            async move {
-                info!("started");
-                let res = listener.forwarding(&mut gateways).await;
-                if let Err(e) = res {
-                    error!("error: {}", e)
-                };
-                let _ = shutdown.send(());
-                info!("end");
-            }
-            .instrument(span),
-        );
+        tokio::spawn(async move { forwarder.run(shutdown).await });
     }
 
     tokio::select! {
@@ -77,15 +49,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn create_listeners(
-    section: &Yaml,
-    gateways: &mut Vec<Gateway>,
-) -> Result<Vec<(Listener, Vec<String>)>, Box<dyn Error>> {
-    let mut listeners = vec![];
+async fn create_forwarders(section: &Yaml) -> Result<Vec<Forwarder>, Box<dyn Error>> {
+    let gateways = create_gateways(&section["out"]).await?;
+    let section = &section["in"];
+    let mut forwarders = vec![];
     for o in section.as_hash() {
         for (alias, opts) in o.iter() {
             let alias = alias.as_str().unwrap();
             let proto = yaml_as_str(opts, "proto")?;
+            let balance = yaml_as_str(opts, "balance")?;
             let write = yaml_as_vec_str(opts, "write")?;
             let inbound = match proto {
                 "tcp" => {
@@ -112,11 +84,21 @@ async fn create_listeners(
                 }
                 _ => panic!("protocol `{}` not supported", proto),
             };
-            let listener = Listener::new(alias.into(), inbound);
-            listeners.push((listener, write));
+            let gateways: Vec<Gateway> = gateways
+                .iter()
+                .filter(|x| write.iter().any(|y| y == x.alias()))
+                .map(|x| x.clone())
+                .collect();
+            let gateways = match balance {
+                "roundrobin" => LoadBalancing::round_robin(gateways),
+                "leastconn" => LoadBalancing::least_conn(gateways),
+                _ => return Err(format!("load balancing {} not supported", balance).into()),
+            };
+            let forwarder = Forwarder::new(alias.into(), inbound, gateways);
+            forwarders.push(forwarder);
         }
     }
-    Ok(listeners)
+    Ok(forwarders)
 }
 
 async fn create_gateways(section: &Yaml) -> Result<Vec<Gateway>, Box<dyn Error>> {

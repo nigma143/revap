@@ -19,9 +19,10 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, info_span, Instrument};
 
 use crate::{
-    bound::{io_process, Gateway, Incoming},
+    balancing::LoadBalancing,
+    bound::{io_process, Incoming},
     mux::{ChannelId, MuxConnection, MuxConnector},
-    pipe::{PipeReader, PipeWriter}, balancing::LoadBalancing,
+    pipe::{PipeReader, PipeWriter},
 };
 
 struct VerifierDummy;
@@ -75,7 +76,6 @@ impl RevTcpInbound {
     }
 
     pub async fn forwarding(&mut self, gateways: &mut LoadBalancing) -> io::Result<()> {
-        let mut index = 0;
         while let Ok((id, reader, writer)) = self.accept().await {
             let mut gateway = gateways.select().clone();
             let span = info_span!(
