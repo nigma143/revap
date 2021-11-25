@@ -6,92 +6,12 @@ use std::{
     },
 };
 
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::mpsc::UnboundedSender,
-};
-use tracing::{error, info, info_span, Instrument};
-
 use crate::{
-    balancing::LoadBalancing,
+    domain::{InboundInfo, OutboundInfo},
     revtcp_bound::{RevTcpInbound, RevTcpOutbound},
     tcp_bound::{TcpInbound, TcpOutbound},
 };
-
-pub struct Forwarder {
-    pub alias: String,
-    pub inbound: Inbound,
-    gateways: LoadBalancing,
-}
-
-impl Forwarder {
-    pub fn new(alias: String, inbound: Inbound, gateways: LoadBalancing) -> Self {
-        Self {
-            alias,
-            inbound,
-            gateways,
-        }
-    }
-
-    pub async fn run(&mut self, shutdown: UnboundedSender<()>) {
-        let span = info_span!(
-            "run",
-            r#in = %self.alias,
-            out = %self.gateways
-                .iter()
-                .map(|x| x.alias())
-                .collect::<Vec<&str>>()
-                .join(", ")
-        );
-        let fut = async {
-            info!("started");
-            let res = self.inbound.forwarding(&mut self.gateways).await;
-            if let Err(e) = res {
-                error!("error: {}", e)
-            };
-            let _ = shutdown.send(());
-            info!("end");
-        };
-
-        fut.instrument(span).await;
-    }
-}
-
-#[derive(Clone)]
-pub struct Gateway {
-    alias: String,
-    outbound: Outbound,
-    active_conn: Arc<AtomicUsize>,
-}
-
-impl Gateway {
-    pub fn new(alias: String, outbound: Outbound) -> Self {
-        Self {
-            alias,
-            outbound,
-            active_conn: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    pub fn alias(&self) -> &str {
-        &self.alias
-    }
-
-    pub fn active_conn(&self) -> usize {
-        self.active_conn.load(Ordering::Relaxed)
-    }
-
-    pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
-    where
-        W: AsyncWrite + Unpin,
-        R: AsyncRead + Unpin,
-    {
-        self.active_conn.fetch_add(1, Ordering::Relaxed);
-        let res = self.outbound.forward(incoming).await;
-        self.active_conn.fetch_sub(1, Ordering::Relaxed);
-        res
-    }
-}
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub enum Inbound {
     Tcp(TcpInbound),
@@ -99,10 +19,17 @@ pub enum Inbound {
 }
 
 impl Inbound {
-    pub async fn forwarding(&mut self, gateways: &mut LoadBalancing) -> io::Result<()> {
+    pub fn info(&self) -> &Arc<InboundInfo> {
         match self {
-            Inbound::Tcp(o) => o.forwarding(gateways).await,
-            Inbound::RevTcp(o) => o.forwarding(gateways).await,
+            Inbound::Tcp(o) => o.info(),
+            Inbound::RevTcp(o) => o.info(),
+        }
+    }
+
+    pub async fn forwarding(&mut self, outbounds: Vec<Outbound>) {
+        match self {
+            Inbound::Tcp(o) => o.forwarding(outbounds).await,
+            Inbound::RevTcp(o) => o.forwarding(outbounds).await,
         }
     }
 }
@@ -119,6 +46,13 @@ pub enum Outbound {
 }
 
 impl Outbound {
+    pub fn info(&self) -> &Arc<OutboundInfo> {
+        match self {
+            Outbound::Tcp(o) => o.info(),
+            Outbound::RevTcp(o) => o.info(),
+        }
+    }
+
     pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
     where
         W: AsyncWrite + Unpin,

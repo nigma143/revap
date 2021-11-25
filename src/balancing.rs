@@ -1,6 +1,6 @@
 use std::ops::Deref;
 
-use crate::bound::Gateway;
+use crate::bound::Outbound;
 
 pub enum LoadBalancing {
     RoundRobin(RoundRobin),
@@ -8,15 +8,15 @@ pub enum LoadBalancing {
 }
 
 impl LoadBalancing {
-    pub fn round_robin(gateways: Vec<Gateway>) -> Self {
-        LoadBalancing::RoundRobin(RoundRobin::new(gateways))
+    pub fn round_robin(outbounds: Vec<Outbound>) -> Self {
+        LoadBalancing::RoundRobin(RoundRobin::new(outbounds))
     }
 
-    pub fn least_conn(gateways: Vec<Gateway>) -> Self {
-        LoadBalancing::LeastConn(LeastConn::new(gateways))
+    pub fn least_conn(outbounds: Vec<Outbound>) -> Self {
+        LoadBalancing::LeastConn(LeastConn::new(outbounds))
     }
 
-    pub fn select(&mut self) -> &mut Gateway {
+    pub fn select(&mut self) -> &mut Outbound {
         match self {
             LoadBalancing::RoundRobin(o) => o.select(),
             LoadBalancing::LeastConn(o) => o.select(),
@@ -25,7 +25,7 @@ impl LoadBalancing {
 }
 
 impl Deref for LoadBalancing {
-    type Target = Vec<Gateway>;
+    type Target = Vec<Outbound>;
 
     fn deref(&self) -> &Self::Target {
         match self {
@@ -37,53 +37,56 @@ impl Deref for LoadBalancing {
 
 pub struct RoundRobin {
     index: usize,
-    gateways: Vec<Gateway>,
+    outbounds: Vec<Outbound>,
 }
 
 impl RoundRobin {
-    pub fn new(gateways: Vec<Gateway>) -> Self {
-        Self { index: 0, gateways }
+    pub fn new(outbounds: Vec<Outbound>) -> Self {
+        Self {
+            index: 0,
+            outbounds,
+        }
     }
 
-    pub fn select(&mut self) -> &mut Gateway {
+    pub fn select(&mut self) -> &mut Outbound {
         let mut index = self.index;
-        if index >= self.gateways.len() {
+        if index >= self.outbounds.len() {
             index = 0;
         }
         self.index = index + 1;
-        self.gateways.get_mut(index).unwrap()
+        self.outbounds.get_mut(index).unwrap()
     }
 }
 
 impl Deref for RoundRobin {
-    type Target = Vec<Gateway>;
+    type Target = Vec<Outbound>;
 
     fn deref(&self) -> &Self::Target {
-        &self.gateways
+        &self.outbounds
     }
 }
 
 pub struct LeastConn {
-    gateways: Vec<Gateway>,
+    outbounds: Vec<Outbound>,
 }
 
 impl LeastConn {
-    pub fn new(gateways: Vec<Gateway>) -> Self {
-        Self { gateways }
+    pub fn new(outbounds: Vec<Outbound>) -> Self {
+        Self { outbounds }
     }
 
-    pub fn select(&mut self) -> &mut Gateway {
-        self.gateways
+    pub fn select(&mut self) -> &mut Outbound {
+        self.outbounds
             .iter_mut()
-            .min_by_key(|x| x.active_conn())
+            .min_by_key(|x| x.info().stats().active_conn())
             .unwrap()
     }
 }
 
 impl Deref for LeastConn {
-    type Target = Vec<Gateway>;
+    type Target = Vec<Outbound>;
 
     fn deref(&self) -> &Self::Target {
-        &self.gateways
+        &self.outbounds
     }
 }

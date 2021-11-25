@@ -1,28 +1,27 @@
-use std::{error::Error, path::Path};
+use std::{error::Error, path::Path, sync::Arc};
 
-use bound::{Gateway, Inbound};
 use tokio::sync::mpsc;
 use yaml_rust::{Yaml, YamlLoader};
 
 use crate::{
-    balancing::LoadBalancing,
-    bound::{Forwarder, Outbound},
+    bound::{Inbound, Outbound},
+    domain::{BalanceType, Domain, InboundInfo, OutboundInfo},
     revtcp_bound::{RevTcpInbound, RevTcpOutbound},
     tcp_bound::{TcpInbound, TcpOutbound},
 };
 
 mod balancing;
 mod bound;
+mod domain;
 pub mod mux;
 mod pipe;
 mod revtcp_bound;
 mod tcp_bound;
+mod dashboard;
 
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let config = {
         let config = std::env::args().nth(1).unwrap_or("revap.yml".into());
@@ -32,37 +31,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let config = &config[0];
 
-    let forwarders = create_forwarders(&config).await?;
+    let mut domain = Domain {
+        inbounds: vec![],
+        outbounds: vec![],
+    };
 
-    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+    let inbounds = create_inbounds(&mut domain, &config["in"]).await?;
+    let outbounds = create_outbounds(&mut domain, &config["out"]).await?;
 
-    for mut forwarder in forwarders {
-        let shutdown = shutdown_tx.clone();
-        tokio::spawn(async move { forwarder.run(shutdown).await });
+    for mut inbound in inbounds {
+        let outbounds: Vec<Outbound> = outbounds
+            .iter()
+            .filter(|x| {
+                inbound
+                    .info()
+                    .write_to()
+                    .iter()
+                    .any(|y| y == x.info().alias())
+            })
+            .map(|x| x.clone())
+            .collect();
+
+        tokio::spawn(async move { inbound.forwarding(outbounds).await });
     }
+
+    dashboard::run_web(domain).await;
+/*
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        println!("{:?}", domain);
+    }*/
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
-        _ = shutdown_rx.recv() => {},
     }
 
     Ok(())
 }
 
-async fn create_forwarders(section: &Yaml) -> Result<Vec<Forwarder>, Box<dyn Error>> {
-    let gateways = create_gateways(&section["out"]).await?;
-    let section = &section["in"];
-    let mut forwarders = vec![];
+async fn create_inbounds(
+    domain: &mut Domain,
+    section: &Yaml,
+) -> Result<Vec<Inbound>, Box<dyn Error>> {
+    let mut inbounds = vec![];
     for o in section.as_hash() {
         for (alias, opts) in o.iter() {
             let alias = alias.as_str().unwrap();
             let proto = yaml_as_str(opts, "proto")?;
             let balance = yaml_as_str(opts, "balance").unwrap_or("roundrobin");
-            let write = yaml_as_vec_str(opts, "write")?;
+            let balance = match balance {
+                "roundrobin" => BalanceType::RoundRobin,
+                "leastconn" => BalanceType::LeastConn,
+                _ => return Err(format!("load balancing {} not supported", balance).into()),
+            };
+            let write_to = yaml_as_vec_str(opts, "write")?;
+            let info = Arc::new(InboundInfo::new(alias, write_to, balance));
             let inbound = match proto {
                 "tcp" => {
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
-                    Inbound::Tcp(TcpInbound::bind_tcp(listen).await?)
+                    Inbound::Tcp(TcpInbound::bind_tcp(info.clone(), listen).await?)
                 }
                 "tls" => {
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
@@ -70,56 +97,59 @@ async fn create_forwarders(section: &Yaml) -> Result<Vec<Forwarder>, Box<dyn Err
                     let key_der_path = yaml_as_str(opts, "private-key")?;
                     let cert_chain = load_certs(Path::new(cert_chain_path))?;
                     let key_der = load_keys(Path::new(key_der_path))?.remove(0);
-                    Inbound::Tcp(TcpInbound::bind_tls(listen, cert_chain, key_der).await?)
+                    Inbound::Tcp(
+                        TcpInbound::bind_tls(info.clone(), listen, cert_chain, key_der).await?,
+                    )
                 }
                 "revtcp" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
                     let access_key = yaml_as_str(opts, "access-key")?;
-                    Inbound::RevTcp(RevTcpInbound::bind_tcp(endpoint, access_key))
+                    Inbound::RevTcp(RevTcpInbound::bind_tcp(info.clone(), endpoint, access_key))
                 }
                 "revtls" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
                     let access_key = yaml_as_str(opts, "access-key")?;
-                    Inbound::RevTcp(RevTcpInbound::bind_tls(endpoint, access_key))
+                    Inbound::RevTcp(RevTcpInbound::bind_tls(info.clone(), endpoint, access_key))
                 }
                 _ => panic!("protocol `{}` not supported", proto),
             };
-            let gateways: Vec<Gateway> = gateways
-                .iter()
-                .filter(|x| write.iter().any(|y| y == x.alias()))
-                .map(|x| x.clone())
-                .collect();
-            let gateways = match balance {
-                "roundrobin" => LoadBalancing::round_robin(gateways),
-                "leastconn" => LoadBalancing::least_conn(gateways),
-                _ => return Err(format!("load balancing {} not supported", balance).into()),
-            };
-            let forwarder = Forwarder::new(alias.into(), inbound, gateways);
-            forwarders.push(forwarder);
+            /*let outbounds: Vec<Outbound> = outbounds
+            .iter()
+            .filter(|x| write.iter().any(|y| y == x.info().alias()))
+            .map(|x| x.clone())
+            .collect();*/
+            domain.inbounds.push(info);
+            inbounds.push(inbound);
         }
     }
-    Ok(forwarders)
+    Ok(inbounds)
 }
 
-async fn create_gateways(section: &Yaml) -> Result<Vec<Gateway>, Box<dyn Error>> {
-    let mut gateways = vec![];
+async fn create_outbounds(
+    domain: &mut Domain,
+    section: &Yaml,
+) -> Result<Vec<Outbound>, Box<dyn Error>> {
+    let mut outbounds = vec![];
     for o in section.as_hash() {
         for (alias, opts) in o.iter() {
             let alias = alias.as_str().unwrap();
             let proto = yaml_as_str(opts, "proto")?;
+            let info = Arc::new(OutboundInfo::new(alias));
             let outbound = match proto {
                 "tcp" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
-                    Outbound::Tcp(TcpOutbound::new_tcp(endpoint))
+                    Outbound::Tcp(TcpOutbound::new_tcp(info.clone(), endpoint))
                 }
                 "tls" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
-                    Outbound::Tcp(TcpOutbound::new_tls(endpoint))
+                    Outbound::Tcp(TcpOutbound::new_tls(info.clone(), endpoint))
                 }
                 "revtcp" => {
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
                     let access_keys = yaml_as_vec_str(opts, "access-keys")?;
-                    Outbound::RevTcp(RevTcpOutbound::bind_tcp(listen, access_keys).await?)
+                    Outbound::RevTcp(
+                        RevTcpOutbound::bind_tcp(info.clone(), listen, access_keys).await?,
+                    )
                 }
                 "revtls" => {
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
@@ -129,16 +159,23 @@ async fn create_gateways(section: &Yaml) -> Result<Vec<Gateway>, Box<dyn Error>>
                     let cert_chain = load_certs(Path::new(cert_chain_path))?;
                     let key_der = load_keys(Path::new(key_der_path))?.remove(0);
                     Outbound::RevTcp(
-                        RevTcpOutbound::bind_tls(listen, access_keys, cert_chain, key_der).await?,
+                        RevTcpOutbound::bind_tls(
+                            info.clone(),
+                            listen,
+                            access_keys,
+                            cert_chain,
+                            key_der,
+                        )
+                        .await?,
                     )
                 }
                 _ => panic!("protocol `{}` not supported", proto),
             };
-            let gateway = Gateway::new(alias.into(), outbound);
-            gateways.push(gateway);
+            domain.outbounds.push(info);
+            outbounds.push(outbound);
         }
     }
-    Ok(gateways)
+    Ok(outbounds)
 }
 
 fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Error>> {

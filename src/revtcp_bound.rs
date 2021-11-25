@@ -16,11 +16,11 @@ use tokio::{
     time,
 };
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, info_span, Instrument};
 
 use crate::{
     balancing::LoadBalancing,
-    bound::{io_process, Incoming},
+    bound::{io_process, Incoming, Outbound},
+    domain::{BalanceType, InboundInfo, OutboundInfo},
     mux::{ChannelId, MuxConnection, MuxConnector},
     pipe::{PipeReader, PipeWriter},
 };
@@ -42,6 +42,7 @@ impl rustls::client::ServerCertVerifier for VerifierDummy {
 }
 
 pub struct RevTcpInbound {
+    info: Arc<InboundInfo>,
     addr: SocketAddr,
     access_key: String,
     tls_connector: Option<tokio_rustls::TlsConnector>,
@@ -49,25 +50,35 @@ pub struct RevTcpInbound {
 }
 
 impl RevTcpInbound {
-    pub fn bind_tcp(addr: SocketAddr, access_key: impl Into<String>) -> Self {
-        RevTcpInbound::bind(addr, access_key.into(), None)
+    pub fn bind_tcp(
+        info: Arc<InboundInfo>,
+        addr: SocketAddr,
+        access_key: impl Into<String>,
+    ) -> Self {
+        RevTcpInbound::bind(info, addr, access_key.into(), None)
     }
 
-    pub fn bind_tls(addr: SocketAddr, access_key: impl Into<String>) -> Self {
+    pub fn bind_tls(
+        info: Arc<InboundInfo>,
+        addr: SocketAddr,
+        access_key: impl Into<String>,
+    ) -> Self {
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(VerifierDummy {}))
             .with_no_client_auth();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        RevTcpInbound::bind(addr, access_key.into(), Some(tls_connector))
+        RevTcpInbound::bind(info, addr, access_key.into(), Some(tls_connector))
     }
 
     fn bind(
+        info: Arc<InboundInfo>,
         addr: SocketAddr,
         access_key: String,
         tls_connector: Option<tokio_rustls::TlsConnector>,
     ) -> Self {
         Self {
+            info,
             addr,
             access_key,
             tls_connector,
@@ -75,27 +86,45 @@ impl RevTcpInbound {
         }
     }
 
-    pub async fn forwarding(&mut self, gateways: &mut LoadBalancing) -> io::Result<()> {
+    pub fn info(&self) -> &Arc<InboundInfo> {
+        &self.info
+    }
+
+    pub async fn forwarding(&mut self, outbounds: Vec<Outbound>) {
+        log::info!(
+            "forwarding `{}` => `{}` ({:?})",
+            self.info().alias(),
+            outbounds
+                .iter()
+                .map(|x| x.info().alias())
+                .collect::<Vec<&str>>()
+                .join(", "),
+            self.info().balance_type(),
+        );
+        let mut outbounds = match self.info().balance_type() {
+            BalanceType::RoundRobin => LoadBalancing::round_robin(outbounds),
+            BalanceType::LeastConn => LoadBalancing::least_conn(outbounds),
+        };
         while let Ok((id, reader, writer)) = self.accept().await {
-            let mut gateway = gateways.select().clone();
-            let span = info_span!(
-                "forwarding",
-                client = %id,
-                target = %gateway.alias()
-            );
-            tokio::spawn(
-                async move {
-                    debug!("started");
-                    let res = gateway.forward(Incoming { reader, writer }).await;
+            let info = self.info().clone();
+            info.stats().active_conn_inc();
+            {
+                let mut outbound = outbounds.select().clone();
+                tokio::spawn(async move {
+                    let res = outbound.forward(Incoming { reader, writer }).await;
                     if let Err(e) = res {
-                        debug!("{}", e);
+                        log::debug!(
+                            "forwarding `{}` => `{}` (channel_id: {}). {}",
+                            info.alias(),
+                            outbound.info().alias(),
+                            id,
+                            e
+                        );
                     }
-                    debug!("end");
-                }
-                .instrument(span),
-            );
+                    info.stats().active_conn_dec();
+                });
+            }
         }
-        Ok(())
     }
 
     async fn accept(&mut self) -> io::Result<(ChannelId, PipeReader, PipeWriter)> {
@@ -107,7 +136,7 @@ impl RevTcpInbound {
                             return Ok(channel);
                         }
                         Err(e) => {
-                            error!("listen mux channel from {}. {}", self.addr, e);
+                            log::error!("listen mux channel from {}. {}", self.addr, e);
                             self.mux = None;
                         }
                     };
@@ -131,11 +160,11 @@ impl RevTcpInbound {
 
                     match res {
                         Ok(mux) => {
-                            info!("connected to mux-server {}", self.addr);
+                            log::info!("connected to mux-server {}", self.addr);
                             self.mux = Some(mux);
                         }
                         Err(e) => {
-                            error!("connecting to mux-server {}. {}", self.addr, e);
+                            log::error!("connecting to mux-server {}. {}", self.addr, e);
                             time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -148,18 +177,21 @@ impl RevTcpInbound {
 
 #[derive(Clone)]
 pub struct RevTcpOutbound {
+    info: Arc<OutboundInfo>,
     conn_tx: Sender<oneshot::Sender<Option<MuxConnector>>>,
 }
 
 impl RevTcpOutbound {
     pub async fn bind_tcp(
+        info: Arc<OutboundInfo>,
         addr: SocketAddr,
         access_keys: Vec<String>,
     ) -> Result<Self, Box<dyn Error>> {
-        RevTcpOutbound::bind(addr, access_keys, None).await
+        RevTcpOutbound::bind(info, addr, access_keys, None).await
     }
 
     pub async fn bind_tls(
+        info: Arc<OutboundInfo>,
         addr: SocketAddr,
         access_keys: Vec<String>,
         cert_chain: Vec<rustls::Certificate>,
@@ -169,10 +201,17 @@ impl RevTcpOutbound {
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key_der)?;
-        RevTcpOutbound::bind(addr, access_keys, Some(TlsAcceptor::from(Arc::new(config)))).await
+        RevTcpOutbound::bind(
+            info,
+            addr,
+            access_keys,
+            Some(TlsAcceptor::from(Arc::new(config))),
+        )
+        .await
     }
 
     async fn bind(
+        info: Arc<OutboundInfo>,
         addr: SocketAddr,
         access_keys: Vec<String>,
         tls_acceptor: Option<TlsAcceptor>,
@@ -223,18 +262,22 @@ impl RevTcpOutbound {
                     };
                     match res {
                         Ok(mux) => {
-                            info!("connected mux-agent on {} from {}", addr, rem_addr);
+                            log::info!("connected mux-agent on {} from {}", addr, rem_addr);
                             pool.lock().unwrap().push(mux);
                         }
                         Err(e) => {
-                            error!("accepting mux-agent on {} from {}. {}", addr, rem_addr, e);
+                            log::error!("accepting mux-agent on {} from {}. {}", addr, rem_addr, e);
                         }
                     }
                 });
             }
         });
 
-        Ok(Self { conn_tx })
+        Ok(Self { info, conn_tx })
+    }
+
+    pub fn info(&self) -> &Arc<OutboundInfo> {
+        &self.info
     }
 
     pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
@@ -242,19 +285,24 @@ impl RevTcpOutbound {
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let Incoming {
-            reader: ri,
-            writer: wi,
-        } = incoming;
+        self.info().stats().active_conn_inc();
+        let res = {
+            let Incoming {
+                reader: ri,
+                writer: wi,
+            } = incoming;
 
-        let (tx, rx) = oneshot::channel();
-        let _ = self.conn_tx.send(tx).await;
-        let mut mux = rx.await.unwrap().ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "transport connection is not established",
-        ))?;
-        let (_id, ro, wo) = mux.connect().await?;
-        io_process(ri, wi, ro, wo).await
+            let (tx, rx) = oneshot::channel();
+            let _ = self.conn_tx.send(tx).await;
+            let mut mux = rx.await.unwrap().ok_or(io::Error::new(
+                io::ErrorKind::Other,
+                "transport connection is not established",
+            ))?;
+            let (_id, ro, wo) = mux.connect().await?;
+            io_process(ri, wi, ro, wo).await
+        };
+        self.info().stats().active_conn_dec();
+        res
     }
 }
 

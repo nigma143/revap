@@ -12,24 +12,29 @@ use tokio::{
 
 use tokio_rustls::rustls::{self};
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info_span, Instrument};
 
 use crate::{
     balancing::LoadBalancing,
-    bound::{io_process, Gateway, Incoming},
+    bound::{io_process, Incoming, Outbound},
+    domain::{BalanceType, InboundInfo, OutboundInfo},
 };
 
 pub struct TcpInbound {
+    info: Arc<InboundInfo>,
     listener: TcpListener,
     tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl TcpInbound {
-    pub async fn bind_tcp(addr: SocketAddr) -> Result<Self, Box<dyn Error>> {
-        TcpInbound::bind(addr, None).await
+    pub async fn bind_tcp(
+        info: Arc<InboundInfo>,
+        addr: SocketAddr,
+    ) -> Result<Self, Box<dyn Error>> {
+        TcpInbound::bind(info, addr, None).await
     }
 
     pub async fn bind_tls(
+        info: Arc<InboundInfo>,
         addr: SocketAddr,
         cert_chain: Vec<rustls::Certificate>,
         key_der: rustls::PrivateKey,
@@ -38,56 +43,76 @@ impl TcpInbound {
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key_der)?;
-        TcpInbound::bind(addr, Some(TlsAcceptor::from(Arc::new(config)))).await
+        TcpInbound::bind(info, addr, Some(TlsAcceptor::from(Arc::new(config)))).await
     }
 
     async fn bind(
+        info: Arc<InboundInfo>,
         addr: SocketAddr,
         tls_acceptor: Option<TlsAcceptor>,
     ) -> Result<Self, Box<dyn Error>> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
+            info,
             listener,
             tls_acceptor,
         })
     }
 
-    pub async fn forwarding(&mut self, gateways: &mut LoadBalancing) -> io::Result<()> {
+    pub fn info(&self) -> &Arc<InboundInfo> {
+        &self.info
+    }
+
+    pub async fn forwarding(&mut self, outbounds: Vec<Outbound>) {
+        log::info!(
+            "forwarding `{}` => `{}` ({:?})",
+            self.info().alias(),
+            outbounds
+                .iter()
+                .map(|x| x.info().alias())
+                .collect::<Vec<&str>>()
+                .join(", "),
+            self.info().balance_type(),
+        );
+        let mut outbounds = match self.info().balance_type() {
+            BalanceType::RoundRobin => LoadBalancing::round_robin(outbounds),
+            BalanceType::LeastConn => LoadBalancing::least_conn(outbounds),
+        };
         while let Ok((stream, rem_addr)) = self.listener.accept().await {
-            let tls_acceptor = self.tls_acceptor.clone();
-            let mut gateway = gateways.select().clone();
-            let span = info_span!(
-                "forwarding",
-                client = %rem_addr,
-                target = %gateway.alias()
-            );
-            tokio::spawn(
-                async move {
-                    debug!("started");
+            let info = self.info.clone();
+            info.stats().active_conn_inc();
+            {
+                let tls_acceptor = self.tls_acceptor.clone();
+                let mut outbound = outbounds.select().clone();
+                tokio::spawn(async move {
                     let res = {
                         if let Some(tls_acceptor) = tls_acceptor {
                             match tls_acceptor.accept(stream).await {
-                                Ok(stream) => TcpInbound::s_forwarding(stream, &mut gateway).await,
+                                Ok(stream) => TcpInbound::s_forwarding(stream, &mut outbound).await,
                                 Err(e) => Err(e),
                             }
                         } else {
-                            TcpInbound::s_forwarding(stream, &mut gateway).await
+                            TcpInbound::s_forwarding(stream, &mut outbound).await
                         }
                     };
                     if let Err(e) = res {
-                        debug!("{}", e);
+                        log::debug!(
+                            "forwarding `{}` => `{}` (client_addr: {}). {}",
+                            info.alias(),
+                            outbound.info().alias(),
+                            rem_addr,
+                            e
+                        );
                     }
-                    debug!("end");
-                }
-                .instrument(span),
-            );
+                    info.stats().active_conn_dec();
+                });
+            }
         }
-        Ok(())
     }
 
     async fn s_forwarding<S: AsyncRead + AsyncWrite>(
         stream: S,
-        outbound: &mut Gateway,
+        outbound: &mut Outbound,
     ) -> io::Result<()> {
         let (reader, writer) = split(stream);
         outbound.forward(Incoming { reader, writer }).await
@@ -96,6 +121,7 @@ impl TcpInbound {
 
 #[derive(Clone)]
 pub struct TcpOutbound {
+    info: Arc<OutboundInfo>,
     addr: SocketAddr,
     tls_connector: Option<tokio_rustls::TlsConnector>,
 }
@@ -117,24 +143,33 @@ impl rustls::client::ServerCertVerifier for VerifierDummy {
 }
 
 impl TcpOutbound {
-    pub fn new_tcp(addr: SocketAddr) -> Self {
-        TcpOutbound::new(addr, None)
+    pub fn new_tcp(info: Arc<OutboundInfo>, addr: SocketAddr) -> Self {
+        TcpOutbound::new(info, addr, None)
     }
 
-    pub fn new_tls(addr: SocketAddr) -> Self {
+    pub fn new_tls(info: Arc<OutboundInfo>, addr: SocketAddr) -> Self {
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(VerifierDummy {}))
             .with_no_client_auth();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        TcpOutbound::new(addr, Some(tls_connector))
+        TcpOutbound::new(info, addr, Some(tls_connector))
     }
 
-    fn new(addr: SocketAddr, tls_connector: Option<tokio_rustls::TlsConnector>) -> Self {
+    fn new(
+        info: Arc<OutboundInfo>,
+        addr: SocketAddr,
+        tls_connector: Option<tokio_rustls::TlsConnector>,
+    ) -> Self {
         Self {
+            info,
             addr,
             tls_connector,
         }
+    }
+
+    pub fn info(&self) -> &Arc<OutboundInfo> {
+        &self.info
     }
 
     pub async fn forward<R, W>(&mut self, incoming: Incoming<R, W>) -> io::Result<()>
@@ -142,15 +177,20 @@ impl TcpOutbound {
         W: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let stream = TcpStream::connect(self.addr).await?;
-        if let Some(tls_connector) = self.tls_connector.as_mut() {
-            let stream = tls_connector
-                .connect("domain".try_into().unwrap(), stream)
-                .await?;
-            TcpOutbound::s_forward(incoming, stream).await
-        } else {
-            TcpOutbound::s_forward(incoming, stream).await
-        }
+        self.info().stats().active_conn_inc();
+        let res = {
+            let stream = TcpStream::connect(self.addr).await?;
+            if let Some(tls_connector) = self.tls_connector.as_mut() {
+                let stream = tls_connector
+                    .connect("domain".try_into().unwrap(), stream)
+                    .await?;
+                TcpOutbound::s_forward(incoming, stream).await
+            } else {
+                TcpOutbound::s_forward(incoming, stream).await
+            }
+        };
+        self.info().stats().active_conn_dec();
+        res
     }
 
     async fn s_forward<R, W, S>(incoming: Incoming<R, W>, stream: S) -> io::Result<()>
