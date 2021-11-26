@@ -1,6 +1,5 @@
 use std::{error::Error, path::Path, sync::Arc};
 
-use tokio::sync::mpsc;
 use yaml_rust::{Yaml, YamlLoader};
 
 use crate::{
@@ -12,12 +11,12 @@ use crate::{
 
 mod balancing;
 mod bound;
+mod dashboard;
 mod domain;
 pub mod mux;
 mod pipe;
 mod revtcp_bound;
 mod tcp_bound;
-mod dashboard;
 
 #[tokio::main()]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -55,12 +54,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(async move { inbound.forwarding(outbounds).await });
     }
 
-    dashboard::run_web(domain).await;
-/*
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        println!("{:?}", domain);
-    }*/
+    match &config["dashboard"] {
+        Yaml::BadValue => {}
+        config => dashboard::run(domain.clone(), config)?,
+    }
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -113,11 +110,6 @@ async fn create_inbounds(
                 }
                 _ => panic!("protocol `{}` not supported", proto),
             };
-            /*let outbounds: Vec<Outbound> = outbounds
-            .iter()
-            .filter(|x| write.iter().any(|y| y == x.info().alias()))
-            .map(|x| x.clone())
-            .collect();*/
             domain.inbounds.push(info);
             inbounds.push(inbound);
         }
@@ -178,7 +170,7 @@ async fn create_outbounds(
     Ok(outbounds)
 }
 
-fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Error>> {
+pub fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Error>> {
     match &node[name] {
         Yaml::BadValue => Err(format!("key {} not found. node: {:?}", name, node).into()),
         val => val
@@ -187,21 +179,21 @@ fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Error>
     }
 }
 
-fn yaml_as_vec_str<'a>(node: &'a Yaml, name: &str) -> Result<Vec<String>, Box<dyn Error>> {
+pub fn yaml_as_vec_str<'a>(node: &'a Yaml, name: &str) -> Result<Vec<String>, Box<dyn Error>> {
     match &node[name] {
-        Yaml::BadValue => Err(format!("key {} not found. node: {:?}", name, node).into()),
+        Yaml::BadValue => Err(format!("key `{}` not found. node: {:?}", name, node).into()),
         val => match val.as_vec() {
             Some(val) => {
                 let mut res = vec![];
                 for e in val.iter() {
                     let e: Result<_, Box<dyn Error>> = e.as_str().ok_or(
-                        format!("invalid value as str by key {}. node: {:?}", name, node).into(),
+                        format!("invalid value as str by key `{}`. node: {:?}", name, node).into(),
                     );
                     res.push(e?.into());
                 }
                 Ok(res)
             }
-            None => Err(format!("key {} is not array. node: {:?}", name, node).into()),
+            None => Err(format!("key `{}` is not array. node: {:?}", name, node).into()),
         },
     }
 }
