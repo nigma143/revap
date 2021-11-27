@@ -30,10 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let config = &config[0];
 
-    let mut domain = Domain {
-        inbounds: vec![],
-        outbounds: vec![],
-    };
+    let mut domain = Domain::default();
 
     let inbounds = create_inbounds(&mut domain, &config["in"]).await?;
     let outbounds = create_outbounds(&mut domain, &config["out"]).await?;

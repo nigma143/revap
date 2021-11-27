@@ -9,6 +9,12 @@ pub struct Domain {
     pub outbounds: Vec<Arc<OutboundInfo>>,
 }
 
+impl Default for Domain {
+    fn default() -> Self {
+        Self { inbounds: Default::default(), outbounds: Default::default() }
+    }
+}
+
 #[derive(Debug)]
 pub struct InboundInfo {
     alias: String,
