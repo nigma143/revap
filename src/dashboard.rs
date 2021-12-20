@@ -47,29 +47,36 @@ fn render_html(domain: &Domain) -> String {
           <th>balance</th>
           <th>active-connection</th>
         </tr>
-        "#.into();
-    for inbound in &domain.inbounds {        
+        "#
+    .into();
+    for inbound in &domain.inbounds {
         html.push_str("<tr>");
         html.push_str(&format!("<td>{}</td>", inbound.alias()));
-        html.push_str(&format!("<td>{:?}</td>", inbound.write_to()));        
-        html.push_str(&format!("<td>{:?}</td>", inbound.balance_type()));          
+        html.push_str(&format!("<td>{:?}</td>", inbound.write_to()));
+        html.push_str(&format!("<td>{:?}</td>", inbound.balance_type()));
         html.push_str(&format!("<td>{}</td>", inbound.stats().active_conn()));
         html.push_str("</tr>");
     }
-    html.push_str(r#"</table>
+    html.push_str(
+        r#"</table>
     <table border="1">  
         <caption>Outbounds</caption>
       <tr>
         <th>alias</th>
+        <th>weight</th>
         <th>active-connection</th>
-      </tr>"#);    
+      </tr>"#,
+    );
     for outbound in &domain.outbounds {
         html.push_str("<tr>");
         html.push_str(&format!("<td>{}</td>", outbound.alias()));
-        html.push_str(&format!("<td>{}</td>", outbound.stats().active_conn()));     
-        html.push_str("</tr>");   
+        html.push_str(&format!("<td>{}</td>", outbound.weight()));
+        html.push_str(&format!("<td>{}</td>", outbound.stats().active_conn()));
+        html.push_str("</tr>");
     }
-    html.push_str(r#"</table>
-    </html>"#);
+    html.push_str(
+        r#"</table>
+    </html>"#,
+    );
     html
 }

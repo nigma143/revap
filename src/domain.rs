@@ -11,7 +11,10 @@ pub struct Domain {
 
 impl Default for Domain {
     fn default() -> Self {
-        Self { inbounds: Default::default(), outbounds: Default::default() }
+        Self {
+            inbounds: Default::default(),
+            outbounds: Default::default(),
+        }
     }
 }
 
@@ -84,19 +87,25 @@ impl InboundStats {
 #[derive(Debug)]
 pub struct OutboundInfo {
     alias: String,
+    weight: isize,
     stats: OutboundStats,
 }
 
 impl OutboundInfo {
-    pub fn new(alias: impl Into<String>) -> Self {
+    pub fn new(alias: impl Into<String>, weight: isize) -> Self {
         Self {
             alias: alias.into(),
+            weight,
             stats: OutboundStats::new(),
         }
     }
 
     pub fn alias(&self) -> &str {
         &self.alias
+    }
+
+    pub fn weight(&self) -> isize {
+        self.weight
     }
 
     pub fn stats(&self) -> &OutboundStats {

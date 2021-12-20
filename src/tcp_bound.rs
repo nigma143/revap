@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     io::{self},
     net::SocketAddr,
@@ -14,7 +15,7 @@ use tokio_rustls::rustls::{self};
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-    balancing::LoadBalancing,
+    balancing::{LoadBalancing, WildMatchGroup},
     bound::{io_process, Incoming, Outbound},
     domain::{BalanceType, InboundInfo, OutboundInfo},
 };
@@ -23,6 +24,7 @@ pub struct TcpInbound {
     info: Arc<InboundInfo>,
     listener: TcpListener,
     tls_acceptor: Option<TlsAcceptor>,
+    sni_map: Option<HashMap<String, Vec<String>>>,
 }
 
 impl TcpInbound {
@@ -30,12 +32,13 @@ impl TcpInbound {
         info: Arc<InboundInfo>,
         addr: SocketAddr,
     ) -> Result<Self, Box<dyn Error>> {
-        TcpInbound::bind(info, addr, None).await
+        TcpInbound::bind(info, addr, None, None).await
     }
 
     pub async fn bind_tls(
         info: Arc<InboundInfo>,
         addr: SocketAddr,
+        sni_map: Option<HashMap<String, Vec<String>>>,
         cert_chain: Vec<rustls::Certificate>,
         key_der: rustls::PrivateKey,
     ) -> Result<Self, Box<dyn Error>> {
@@ -43,12 +46,19 @@ impl TcpInbound {
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key_der)?;
-        TcpInbound::bind(info, addr, Some(TlsAcceptor::from(Arc::new(config)))).await
+        TcpInbound::bind(
+            info,
+            addr,
+            sni_map,
+            Some(TlsAcceptor::from(Arc::new(config))),
+        )
+        .await
     }
 
     async fn bind(
         info: Arc<InboundInfo>,
         addr: SocketAddr,
+        sni_map: Option<HashMap<String, Vec<String>>>,
         tls_acceptor: Option<TlsAcceptor>,
     ) -> Result<Self, Box<dyn Error>> {
         let listener = TcpListener::bind(addr).await?;
@@ -56,6 +66,7 @@ impl TcpInbound {
             info,
             listener,
             tls_acceptor,
+            sni_map,
         })
     }
 
@@ -63,7 +74,7 @@ impl TcpInbound {
         &self.info
     }
 
-    pub async fn forwarding(&mut self, outbounds: Vec<Outbound>) {
+    pub async fn forwarding(&mut self, mut outbounds: Vec<Outbound>) {
         log::info!(
             "forwarding `{}` => `{}` ({:?})",
             self.info().alias(),
@@ -74,35 +85,83 @@ impl TcpInbound {
                 .join(", "),
             self.info().balance_type(),
         );
-        let mut outbounds = match self.info().balance_type() {
-            BalanceType::RoundRobin => LoadBalancing::round_robin(outbounds),
-            BalanceType::LeastConn => LoadBalancing::least_conn(outbounds),
+        let sni_outbounds = {
+            match self.sni_map {
+                Some(ref map) => {
+                    let mut res = vec![];
+                    for (sni, vals) in map {
+                        let outbounds: Vec<Outbound> = outbounds
+                            .drain_filter(|x| vals.iter().any(|y| y == x.info().alias()))
+                            .collect();
+                        let outbounds = match self.info().balance_type() {
+                            BalanceType::RoundRobin => LoadBalancing::round_robin(outbounds),
+                            BalanceType::LeastConn => LoadBalancing::least_conn(outbounds),
+                        };
+                        res.push((sni.as_str(), outbounds));
+                    }
+                    Arc::new(Some(WildMatchGroup::new(res)))
+                }
+                None => Arc::new(None),
+            }
+        };
+        let outbounds = match self.info().balance_type() {
+            BalanceType::RoundRobin => Arc::new(LoadBalancing::round_robin(outbounds)),
+            BalanceType::LeastConn => Arc::new(LoadBalancing::least_conn(outbounds)),
         };
         while let Ok((stream, rem_addr)) = self.listener.accept().await {
             let info = self.info.clone();
             info.stats().active_conn_inc();
             {
                 let tls_acceptor = self.tls_acceptor.clone();
-                let mut outbound = outbounds.select().clone();
+                let sni_outbounds = sni_outbounds.clone();
+                let outbounds = outbounds.clone();
                 tokio::spawn(async move {
-                    let res = {
-                        if let Some(tls_acceptor) = tls_acceptor {
-                            match tls_acceptor.accept(stream).await {
-                                Ok(stream) => TcpInbound::s_forwarding(stream, &mut outbound).await,
-                                Err(e) => Err(e),
+                    match tls_acceptor {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(mut stream) => {
+                                let (_, conn) = stream.get_ref();
+                                let mut outbound = conn
+                                    .sni_hostname()
+                                    .and_then(|x| {
+                                        (*sni_outbounds).as_ref().and_then(|y| y.select(x))
+                                    })
+                                    .map_or_else(|| outbounds.select(), |x| x);
+                                let res =
+                                    TcpInbound::s_forwarding(&mut stream, &mut outbound).await;
+                                if let Err(e) = res {
+                                    let (_, conn) = stream.get_ref();
+                                    log::debug!(
+                                            "forwarding error `{}` => `{}` (client_addr: {}, sni: {:?}). {}",
+                                            info.alias(),
+                                            outbound.info().alias(),
+                                            rem_addr,
+                                            conn.sni_hostname(),
+                                            e
+                                        );
+                                }
                             }
-                        } else {
-                            TcpInbound::s_forwarding(stream, &mut outbound).await
+                            Err(e) => {
+                                log::debug!(
+                                    "accept tls error at `{}` (client_addr: {}). {}",
+                                    info.alias(),
+                                    rem_addr,
+                                    e
+                                );
+                            }
+                        },
+                        None => {
+                            let mut outbound = outbounds.select();
+                            let res = TcpInbound::s_forwarding(stream, &mut outbound).await;
+                            if let Err(e) = res {
+                                log::debug!(
+                                    "forwarding error `{}` => `{}` (client_addr: {}). {}",
+                                    info.alias(),
+                                    outbound.info().alias(),
+                                    rem_addr,
+                                    e
+                                );
+                            }
                         }
-                    };
-                    if let Err(e) = res {
-                        log::debug!(
-                            "forwarding `{}` => `{}` (client_addr: {}). {}",
-                            info.alias(),
-                            outbound.info().alias(),
-                            rem_addr,
-                            e
-                        );
                     }
                     info.stats().active_conn_dec();
                 });

@@ -1,4 +1,6 @@
-use std::{error::Error, path::Path, sync::Arc};
+#![feature(drain_filter)]
+
+use std::{collections::HashMap, error::Error, path::Path, sync::Arc};
 
 use yaml_rust::{Yaml, YamlLoader};
 
@@ -29,7 +31,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         YamlLoader::load_from_str(&content).unwrap()
     };
     let config = &config[0];
-
+    
     let mut domain = Domain::default();
 
     let inbounds = create_inbounds(&mut domain, &config["in"]).await?;
@@ -86,13 +88,15 @@ async fn create_inbounds(
                     Inbound::Tcp(TcpInbound::bind_tcp(info.clone(), listen).await?)
                 }
                 "tls" => {
+                    let sni_map = y_select(&opts["sni"]).and_then(|x| Some(y_as_map_vec_str(x)));
                     let listen = yaml_as_str(opts, "listen")?.parse()?;
                     let cert_chain_path = yaml_as_str(opts, "cert-chain")?;
                     let key_der_path = yaml_as_str(opts, "private-key")?;
                     let cert_chain = load_certs(Path::new(cert_chain_path))?;
                     let key_der = load_keys(Path::new(key_der_path))?.remove(0);
                     Inbound::Tcp(
-                        TcpInbound::bind_tls(info.clone(), listen, cert_chain, key_der).await?,
+                        TcpInbound::bind_tls(info.clone(), listen, sni_map, cert_chain, key_der)
+                            .await?,
                     )
                 }
                 "revtcp" => {
@@ -123,7 +127,8 @@ async fn create_outbounds(
         for (alias, opts) in o.iter() {
             let alias = alias.as_str().unwrap();
             let proto = yaml_as_str(opts, "proto")?;
-            let info = Arc::new(OutboundInfo::new(alias));
+            let weight = yaml_as_isize(opts, "weight")?;
+            let info = Arc::new(OutboundInfo::new(alias, weight));
             let outbound = match proto {
                 "tcp" => {
                     let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
@@ -167,6 +172,16 @@ async fn create_outbounds(
     Ok(outbounds)
 }
 
+pub fn yaml_as_isize(node: &Yaml, name: &str) -> Result<isize, Box<dyn Error>> {
+    match &node[name] {
+        Yaml::BadValue => Err(format!("key {} not found. node: {:?}", name, node).into()),
+        val => val
+            .as_i64()
+            .ok_or(format!("invalid value as str by key {}. node: {:?}", name, node).into())
+            .map(|x| x as isize),
+    }
+}
+
 pub fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Error>> {
     match &node[name] {
         Yaml::BadValue => Err(format!("key {} not found. node: {:?}", name, node).into()),
@@ -176,20 +191,59 @@ pub fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Er
     }
 }
 
-pub fn yaml_as_vec_str<'a>(node: &'a Yaml, name: &str) -> Result<Vec<String>, Box<dyn Error>> {
+pub fn y_select(node: &Yaml) -> Option<&Yaml> {
+    match node {
+        Yaml::BadValue => None,
+        _ => Some(node),
+    }
+}
+
+pub fn y_as_map_vec_str(node: &Yaml) -> HashMap<String, Vec<String>> {
+    match &node {
+        Yaml::Hash(v) => {
+            let mut map = HashMap::new();
+            for val in v.iter() {
+                let key = y_as_str(val.0);
+                let value = y_as_vec_str(val.1);
+                map.insert(key, value);
+            }
+            map
+        }
+        _ => panic!("invalid value as map vec str. node: {:?}", node),
+    }
+}
+
+pub fn y_as_vec_str(node: &Yaml) -> Vec<String> {
+    match &node {
+        Yaml::Array(v) => v.iter().map(|x| y_as_str(x)).collect(),
+        _ => panic!("invalid value as vec str. node: {:?}", node),
+    }
+}
+
+pub fn y_as_str(node: &Yaml) -> String {
+    match &node {
+        Yaml::String(v) => v.into(),
+        _ => panic!("invalid value as str. node: {:?}", node),
+    }
+}
+
+pub fn yaml_as_vec_str(node: &Yaml, name: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let arr = yaml_as_vec(node, name)?;
+    let mut res = vec![];
+    for e in arr.iter() {
+        let e: Result<_, Box<dyn Error>> = e
+            .as_str()
+            .ok_or(format!("invalid value as str by key `{}`. node: {:?}", name, node).into());
+        res.push(e?.into());
+    }
+    Ok(res)
+}
+
+pub fn yaml_as_vec<'a>(node: &'a Yaml, name: &str) -> Result<&'a Vec<Yaml>, Box<dyn Error>> {
     match &node[name] {
         Yaml::BadValue => Err(format!("key `{}` not found. node: {:?}", name, node).into()),
         val => match val.as_vec() {
-            Some(val) => {
-                let mut res = vec![];
-                for e in val.iter() {
-                    let e: Result<_, Box<dyn Error>> = e.as_str().ok_or(
-                        format!("invalid value as str by key `{}`. node: {:?}", name, node).into(),
-                    );
-                    res.push(e?.into());
-                }
-                Ok(res)
-            }
+            Some(val) => Ok(val),
             None => Err(format!("key `{}` is not array. node: {:?}", name, node).into()),
         },
     }
