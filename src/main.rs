@@ -31,11 +31,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         YamlLoader::load_from_str(&content).unwrap()
     };
     let config = &config[0];
-    
+
     let mut domain = Domain::default();
 
-    let inbounds = create_inbounds(&mut domain, &config["in"]).await?;
-    let outbounds = create_outbounds(&mut domain, &config["out"]).await?;
+    let inbounds = create_inbounds(&mut domain, &config["in"]).await;
+    let outbounds = create_outbounds(&mut domain, &config["out"]).await;
 
     for mut inbound in inbounds {
         let outbounds: Vec<Outbound> = outbounds
@@ -65,48 +65,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn create_inbounds(
-    domain: &mut Domain,
-    section: &Yaml,
-) -> Result<Vec<Inbound>, Box<dyn Error>> {
+async fn create_inbounds(domain: &mut Domain, section: &Yaml) -> Vec<Inbound> {
     let mut inbounds = vec![];
     for o in section.as_hash() {
         for (alias, opts) in o.iter() {
-            let alias = alias.as_str().unwrap();
-            let proto = yaml_as_str(opts, "proto")?;
-            let balance = yaml_as_str(opts, "balance").unwrap_or("roundrobin");
-            let balance = match balance {
+            let alias = y_as_str(alias);
+            let proto = y_as_str(&opts["proto"]);
+            let balance = y_select(&opts["balance"])
+                .and_then(|x| Some(y_as_str(x)))
+                .unwrap_or("roundrobin".into());
+            let balance = match balance.as_str() {
                 "roundrobin" => BalanceType::RoundRobin,
                 "leastconn" => BalanceType::LeastConn,
-                _ => return Err(format!("load balancing {} not supported", balance).into()),
+                _ => panic!("load balancing {} not supported", balance),
             };
-            let write_to = yaml_as_vec_str(opts, "write")?;
+            let write_to = y_as_vec_str(&opts["write"]);
             let info = Arc::new(InboundInfo::new(alias, write_to, balance));
-            let inbound = match proto {
+            let inbound = match proto.as_str() {
                 "tcp" => {
-                    let listen = yaml_as_str(opts, "listen")?.parse()?;
-                    Inbound::Tcp(TcpInbound::bind_tcp(info.clone(), listen).await?)
+                    let listen = y_as_str(&opts["listen"]).parse().unwrap();
+                    Inbound::Tcp(TcpInbound::bind_tcp(info.clone(), listen).await.unwrap())
                 }
                 "tls" => {
                     let sni_map = y_select(&opts["sni"]).and_then(|x| Some(y_as_map_vec_str(x)));
-                    let listen = yaml_as_str(opts, "listen")?.parse()?;
-                    let cert_chain_path = yaml_as_str(opts, "cert-chain")?;
-                    let key_der_path = yaml_as_str(opts, "private-key")?;
-                    let cert_chain = load_certs(Path::new(cert_chain_path))?;
-                    let key_der = load_keys(Path::new(key_der_path))?.remove(0);
+                    let listen = y_as_str(&opts["listen"]).parse().unwrap();
+                    let cert_chain_path = y_as_str(&opts["cert-chain"]);
+                    let key_der_path = y_as_str(&opts["private-key"]);
+                    let cert_chain = load_certs(Path::new(&cert_chain_path)).unwrap();
+                    let key_der = load_keys(Path::new(&key_der_path)).unwrap().remove(0);
                     Inbound::Tcp(
                         TcpInbound::bind_tls(info.clone(), listen, sni_map, cert_chain, key_der)
-                            .await?,
+                            .await
+                            .unwrap(),
                     )
                 }
                 "revtcp" => {
-                    let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
-                    let access_key = yaml_as_str(opts, "access-key")?;
+                    let endpoint = y_as_str(&opts["endpoint"]).parse().unwrap();
+                    let access_key = y_as_str(&opts["access-key"]);
                     Inbound::RevTcp(RevTcpInbound::bind_tcp(info.clone(), endpoint, access_key))
                 }
                 "revtls" => {
-                    let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
-                    let access_key = yaml_as_str(opts, "access-key")?;
+                    let endpoint = y_as_str(&opts["endpoint"]).parse().unwrap();
+                    let access_key = y_as_str(&opts["access-key"]);
                     Inbound::RevTcp(RevTcpInbound::bind_tls(info.clone(), endpoint, access_key))
                 }
                 _ => panic!("protocol `{}` not supported", proto),
@@ -115,43 +115,42 @@ async fn create_inbounds(
             inbounds.push(inbound);
         }
     }
-    Ok(inbounds)
+    inbounds
 }
 
-async fn create_outbounds(
-    domain: &mut Domain,
-    section: &Yaml,
-) -> Result<Vec<Outbound>, Box<dyn Error>> {
+async fn create_outbounds(domain: &mut Domain, section: &Yaml) -> Vec<Outbound> {
     let mut outbounds = vec![];
     for o in section.as_hash() {
         for (alias, opts) in o.iter() {
-            let alias = alias.as_str().unwrap();
-            let proto = yaml_as_str(opts, "proto")?;
-            let weight = yaml_as_isize(opts, "weight")?;
+            let alias = y_as_str(alias);
+            let proto = y_as_str(&opts["proto"]);
+            let weight = y_as_isize(&opts["weight"]);
             let info = Arc::new(OutboundInfo::new(alias, weight));
-            let outbound = match proto {
+            let outbound = match proto.as_str() {
                 "tcp" => {
-                    let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
+                    let endpoint = y_as_str(&opts["endpoint"]).parse().unwrap();
                     Outbound::Tcp(TcpOutbound::new_tcp(info.clone(), endpoint))
                 }
                 "tls" => {
-                    let endpoint = yaml_as_str(opts, "endpoint")?.parse()?;
+                    let endpoint = y_as_str(&opts["endpoint"]).parse().unwrap();
                     Outbound::Tcp(TcpOutbound::new_tls(info.clone(), endpoint))
                 }
                 "revtcp" => {
-                    let listen = yaml_as_str(opts, "listen")?.parse()?;
-                    let access_keys = yaml_as_vec_str(opts, "access-keys")?;
+                    let listen = y_as_str(&opts["listen"]).parse().unwrap();
+                    let access_keys = y_as_vec_str(&opts["access-keys"]);
                     Outbound::RevTcp(
-                        RevTcpOutbound::bind_tcp(info.clone(), listen, access_keys).await?,
+                        RevTcpOutbound::bind_tcp(info.clone(), listen, access_keys)
+                            .await
+                            .unwrap(),
                     )
                 }
                 "revtls" => {
-                    let listen = yaml_as_str(opts, "listen")?.parse()?;
-                    let access_keys = yaml_as_vec_str(opts, "access-keys")?;
-                    let cert_chain_path = yaml_as_str(opts, "cert-chain")?;
-                    let key_der_path = yaml_as_str(opts, "private-key")?;
-                    let cert_chain = load_certs(Path::new(cert_chain_path))?;
-                    let key_der = load_keys(Path::new(key_der_path))?.remove(0);
+                    let listen = y_as_str(&opts["listen"]).parse().unwrap();
+                    let access_keys = y_as_vec_str(&opts["access-keys"]);
+                    let cert_chain_path = y_as_str(&opts["cert-chain"]);
+                    let key_der_path = y_as_str(&opts["private-key"]);
+                    let cert_chain = load_certs(Path::new(&cert_chain_path)).unwrap();
+                    let key_der = load_keys(Path::new(&key_der_path)).unwrap().remove(0);
                     Outbound::RevTcp(
                         RevTcpOutbound::bind_tls(
                             info.clone(),
@@ -160,7 +159,8 @@ async fn create_outbounds(
                             cert_chain,
                             key_der,
                         )
-                        .await?,
+                        .await
+                        .unwrap(),
                     )
                 }
                 _ => panic!("protocol `{}` not supported", proto),
@@ -169,26 +169,7 @@ async fn create_outbounds(
             outbounds.push(outbound);
         }
     }
-    Ok(outbounds)
-}
-
-pub fn yaml_as_isize(node: &Yaml, name: &str) -> Result<isize, Box<dyn Error>> {
-    match &node[name] {
-        Yaml::BadValue => Err(format!("key {} not found. node: {:?}", name, node).into()),
-        val => val
-            .as_i64()
-            .ok_or(format!("invalid value as str by key {}. node: {:?}", name, node).into())
-            .map(|x| x as isize),
-    }
-}
-
-pub fn yaml_as_str<'a>(node: &'a Yaml, name: &str) -> Result<&'a str, Box<dyn Error>> {
-    match &node[name] {
-        Yaml::BadValue => Err(format!("key {} not found. node: {:?}", name, node).into()),
-        val => val
-            .as_str()
-            .ok_or(format!("invalid value as str by key {}. node: {:?}", name, node).into()),
-    }
+    outbounds
 }
 
 pub fn y_select(node: &Yaml) -> Option<&Yaml> {
@@ -227,25 +208,10 @@ pub fn y_as_str(node: &Yaml) -> String {
     }
 }
 
-pub fn yaml_as_vec_str(node: &Yaml, name: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    let arr = yaml_as_vec(node, name)?;
-    let mut res = vec![];
-    for e in arr.iter() {
-        let e: Result<_, Box<dyn Error>> = e
-            .as_str()
-            .ok_or(format!("invalid value as str by key `{}`. node: {:?}", name, node).into());
-        res.push(e?.into());
-    }
-    Ok(res)
-}
-
-pub fn yaml_as_vec<'a>(node: &'a Yaml, name: &str) -> Result<&'a Vec<Yaml>, Box<dyn Error>> {
-    match &node[name] {
-        Yaml::BadValue => Err(format!("key `{}` not found. node: {:?}", name, node).into()),
-        val => match val.as_vec() {
-            Some(val) => Ok(val),
-            None => Err(format!("key `{}` is not array. node: {:?}", name, node).into()),
-        },
+pub fn y_as_isize(node: &Yaml) -> isize {
+    match &node {
+        Yaml::Integer(v) => *v as isize,
+        _ => panic!("invalid value as isize. node: {:?}", node),
     }
 }
 

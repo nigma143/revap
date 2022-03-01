@@ -6,11 +6,11 @@ use warp::{
 };
 use yaml_rust::Yaml;
 
-use crate::{domain::Domain, yaml_as_str, yaml_as_vec_str};
+use crate::{domain::Domain, y_as_str, y_as_vec_str};
 
 pub fn run(domain: Domain, config: &Yaml) -> Result<(), Box<dyn Error>> {
-    let listen: SocketAddr = yaml_as_str(config, "listen")?.parse()?;
-    let access_keys = yaml_as_vec_str(config, "access-keys")?;
+    let listen: SocketAddr = y_as_str(&config["listen"]).parse().unwrap();
+    let access_keys = y_as_vec_str(&config["access-keys"]);
     let stats = warp::get()
         .and(warp::path("stats"))
         .and(warp::query::raw())
